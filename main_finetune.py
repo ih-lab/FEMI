@@ -30,32 +30,20 @@ warnings.filterwarnings("ignore")
 
 def get_args_parser():
     parser = argparse.ArgumentParser('MAE fine-tuning for image classification', add_help=False)
-    parser.add_argument('--batch_size', default=64, type=int,
+    parser.add_argument('--batch_size', default=32, type=int,
                         help='Batch size per GPU (effective batch size is batch_size * accum_iter * # gpus')
     parser.add_argument('--buffer_size', default=1024, type=int,
                         help='Buffer size')
     parser.add_argument('--epochs', default=500, type=int)
 
     # Optimizer parameters
-    parser.add_argument('--weight_decay', type=float, default=0.05,
-                        help='weight decay (default: 0.05)')
     parser.add_argument('--blr', type=float, default=1e-3, metavar='LR',
                         help='base learning rate')
-    parser.add_argument('--warmup_epochs', type=int, default=10, metavar='N',
-                        help='epochs to warmup LR')
-
-    # Augmentation parameters
-    parser.add_argument('--data_augmentation', type=float, default=False, metavar='DATA_AUG',
-                        help='Use data augmentation, if true')
     
     # Model Parameters
-    parser.add_argument('--mask_ratio', type=float, default=0.75,
-                        help='mask ratio (default: 0.75)')
     parser.add_argument('--early_stopping_patience', type=int, default=25,
                         help='early stopping patience (default: 25)')
-    parser.add_argument('--save_every_epoch', type=int, default=True,
-                        help='save model every epoch (default: True)')
-    parser.add_argument('--do_binary_classification', type=int, default=True,
+    parser.add_argument('--do_binary_classification', type=int, default=False,
                         help='do binary classification (default: True)')
     parser.add_argument('--do_regression', type=int, default=False,
                         help='do regression (default: False)')
@@ -65,16 +53,14 @@ def get_args_parser():
                         help='number of transformer blocks to unfreeze (default: 1)')
     parser.add_argument('--video_input', type=int, default=False,
                         help='use video instead of image input (default: False)')
+    parser.add_argument('--num_frames_in_vid', type=int, default=18,
+                        help='number of frames in video (default: 1)')
     parser.add_argument('--use_reduce_lr_on_plateau', type=int, default=True,
                         help='use reduce lr on plateau (default: True)')
 
     # * Finetuning params
-    parser.add_argument('--resume_from_femi', default='',type=str,
-                        help='resume from FEMI checkpoint')
-    parser.add_argument('--femi_data_path', default='',type=str,
-                        help='FEMI data path')
-    parser.add_argument('--imagenet_vit_mae_path', default='',type=str,
-                        help='ImageNet vit mae path')
+    parser.add_argument('--femi_path', default='',type=str,
+                        help='FEMI model path')
     parser.add_argument('--validation_split', default=0.2, type=float,
                         help='validation split percentage')
 
@@ -139,8 +125,10 @@ def main():
 
     if args.video_input:
         do_image_classification = 0
+        num_frames_in_vid = args.num_frames_in_vid
     else:
         do_image_classification = 1
+        num_frames_in_vid = 1
 
     train_dataset_fraction = 1 - args.validation_split
     val_dataset_fraction = args.validation_split
@@ -154,7 +142,6 @@ def main():
     if args.use_reduce_lr_on_plateau:
         REDUCE_LR_PATIENCE = 5
         REDUCE_LR_FACTOR = 0.1
-        REDUCE_LR_COOLDOWN = 0
 
 
     imagenet_mean = tf.constant([0.485, 0.456, 0.406], dtype=tf.float32)
@@ -242,8 +229,7 @@ def main():
         if do_image_classification:
             inp = Input(shape=(224, 224, 3))
         
-        model = TFViTMAEForPreTraining.from_pretrained(args.imagenet_vit_mae_path)
-        model.load_weights(args.femi_data_path)
+        model = TFViTMAEForPreTraining.from_pretrained(args.femi_data_path)
         num_hidden_layers = 24
         model.config.mask_ratio = 0
         model.config.hidden_dropout_prob = 0.2
@@ -338,9 +324,9 @@ def main():
             final_loss_weights = {'binary_output':1}
         elif regression_task:
             final_outputs = [regression_model_output]
-            final_loss = {'bs_output':'logcosh'}
-            final_metrics = {'bs_output':['mean_absolute_error', lr_metric]}
-            final_loss_weights = {'bs_output':1}
+            final_loss = {'regression_output':'logcosh'}
+            final_metrics = {'regression_output':['mean_absolute_error', lr_metric]}
+            final_loss_weights = {'regression_output':1}
 
         # Compile the model
         model = Model(inputs=final_inputs, outputs=final_outputs)
@@ -390,13 +376,8 @@ def main():
     train_df = train_all_df.reset_index(drop=True)
     train_dfs = [train_df]
     val_dfs = [val_df]
-    source_train_gen = IVFDataset(dir, BATCH_SIZE, train_dfs)
-    source_val_gen = IVFDataset(dir, BATCH_SIZE, val_dfs)
-
-    print("Number of batches ", len(source_train_gen))
-    print("Number of batches ", len(source_val_gen))
-    print("Number of training samples ", len(source_train_gen.samples), " Train Dataset Fraction: ", train_dataset_fraction)
-    print("Number of validation samples ", len(source_val_gen.samples), " Validation Dataset Fraction: ", val_dataset_fraction)
+    source_train_gen = IVFDataset(dir, BATCH_SIZE, train_dfs, n_frames=num_frames_in_vid)
+    source_val_gen = IVFDataset(dir, BATCH_SIZE, val_dfs, n_frames=num_frames_in_vid)
 
     if USE_MULTIPROCESSING:
         strategy = tf.distribute.MirroredStrategy()

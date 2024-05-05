@@ -51,12 +51,8 @@ def get_args_parser():
                         help='save model every epoch (default: True)')
 
     # * Finetuning params
-    parser.add_argument('--resume_from_femi', default='',type=str,
-                        help='resume from FEMI checkpoint')
-    parser.add_argument('--femi_data_path', default='',type=str,
-                        help='FEMI data path')
-    parser.add_argument('--imagenet_vit_mae_path', default='',type=str,
-                        help='ImageNet vit mae path')
+    parser.add_argument('--femi_model_path', default='',type=str,
+                        help='FEMI model path')
     parser.add_argument('--validation_split', default=0.2, type=float,
                         help='validation split percentage')
 
@@ -189,28 +185,18 @@ def main():
     ### COMPILATION AND TRAINING
     print("Compiling the model...")
 
-    start_from_femi = args.resume_from_femi
-    if start_from_femi:
-        path_to_FEMI = args.femi_data_path
-    else:
-        path_to_imagenet_vit_mae = args.imagenet_vit_mae_path
+    path_to_FEMI = args.femi_model_path
 
     if USE_MULTIPROCESSING:
         strategy = tf.distribute.MirroredStrategy()
         print('Number of devices: {}'.format(strategy.num_replicas_in_sync))
         with strategy.scope():
-            if start_from_femi:
-                model = TFViTMAEForPreTraining.from_pretrained(path_to_FEMI)
-            else:
-                model = TFViTMAEForPreTraining.from_pretrained(path_to_imagenet_vit_mae)
+            model = TFViTMAEForPreTraining.from_pretrained(path_to_FEMI)
             model.config.mask_ratio = args.mask_ratio
             optimizer = tf.keras.optimizers.AdamW(learning_rate=scheduled_lrs, weight_decay=WEIGHT_DECAY, beta_1=beta_1, beta_2=beta_2)
             model.compile(optimizer=optimizer, loss='auto', metrics=['mae'])
     else:
-        if start_from_femi:
-                model = TFViTMAEForPreTraining.from_pretrained(path_to_FEMI)
-        else:
-            model = TFViTMAEForPreTraining.from_pretrained(path_to_imagenet_vit_mae)
+        model = TFViTMAEForPreTraining.from_pretrained(path_to_FEMI)
         model.config.mask_ratio = args.mask_ratio
         optimizer = tf.keras.optimizers.AdamW(learning_rate=scheduled_lrs, weight_decay=WEIGHT_DECAY, beta_1=beta_1, beta_2=beta_2)
         model.compile(optimizer=optimizer, loss='auto', metrics=['mae'])
