@@ -59,7 +59,7 @@ def get_args_parser():
                         help='use reduce lr on plateau (default: True)')
 
     # * Finetuning params
-    parser.add_argument('--femi_path', default='',type=str,
+    parser.add_argument('--femi_model_path', default='',type=str,
                         help='FEMI model path')
     parser.add_argument('--validation_split', default=0.2, type=float,
                         help='validation split percentage')
@@ -81,14 +81,14 @@ def get_args_parser():
     return parser
 
 
-def main():
-    if args.devide == 'gpu':
+def main(args):
+    if args.device == 'gpu':
         if args.GPUs is None:
             raise ValueError('GPUs must be specified when using GPU')
         os.environ['CUDA_VISIBLE_DEVICES'] = args.GPUs
         NUM_GPUS = len(args.GPUs.split(','))
         NUM_DEVICES = NUM_GPUS
-        if len(NUM_GPUS) > 1:
+        if NUM_GPUS > 1:
             USE_MULTIPROCESSING = 1
         else:
             USE_MULTIPROCESSING = 0
@@ -167,8 +167,10 @@ def main():
             for i, folder in enumerate(self.folders):
                 label_dict = df_labels[i].set_index('SUBJECT_NO').to_dict(orient='index')
                 label_dicts.append(label_dict)
-                samples = [os.path.join(folder, dir_name) for dir_name in os.listdir(folder) 
-                            if dir_name in label_dict]
+                samples = []
+                for dir_name in os.listdir(folder):
+                    if dir_name in label_dict and len(os.listdir(os.path.join(folder, dir_name))) > self.n_frames:
+                        samples.append(os.path.join(folder, dir_name))
                 all_samples.extend(samples)
             self.samples = all_samples
             if batch_size_frac is not None:
@@ -201,14 +203,14 @@ def main():
                         batch_images.append(img)
                     else:
                         images.append(img)            
-                        vid = tf.stack(images, axis=0)     
-                        batch_images.append(vid)
-
+                
+                vid = tf.stack(images, axis=0)  
+                batch_images.append(vid)
                 # Use pre-computed labels
                 labels = self.label_dict[os.path.basename(sample)]
                 final_labels.append(labels.get('LABEL', 0))
                 if not exclude_age:
-                    age_input.append(labels['AGE_AT_RET'] / 50)
+                    age_input.append(labels['AGE'] / 50)
 
             if not exclude_age:
                 x = [np.array(batch_images), np.array(age_input)]
@@ -229,7 +231,7 @@ def main():
         if do_image_classification:
             inp = Input(shape=(224, 224, 3))
         
-        model = TFViTMAEForPreTraining.from_pretrained(args.femi_data_path)
+        model = TFViTMAEForPreTraining.from_pretrained(args.femi_model_path)
         num_hidden_layers = 24
         model.config.mask_ratio = 0
         model.config.hidden_dropout_prob = 0.2
@@ -367,6 +369,8 @@ def main():
 
     # Train the model
     data_dir = args.data_path
+    if not data_dir.endswith('/'):
+        data_dir += '/'
     dir = [data_dir]
     df_data = internal_df.copy()
     df_data = df_data.sample(frac=1).reset_index(drop=True)
@@ -391,7 +395,7 @@ def main():
                         epochs=EPOCHS,
                         validation_data=source_val_gen,
                         callbacks=callbacks, verbose=1)
-    filepath = args.output_dir + '/' + args.output_model_name + "-final" + "/ckpt"
+    filepath = args.output_dir + '/' + 'ft-' + args.output_model_name + "-final" + "/ckpt"
     task_model.save_weights(filepath)
 
 
