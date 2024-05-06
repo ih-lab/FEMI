@@ -71,14 +71,14 @@ def get_args_parser():
     return parser
 
 
-def main():
-    if args.devide == 'gpu':
+def main(args):
+    if args.device == 'gpu':
         if args.GPUs is None:
             raise ValueError('GPUs must be specified when using GPU')
         os.environ['CUDA_VISIBLE_DEVICES'] = args.GPUs
         NUM_GPUS = len(args.GPUs.split(','))
         NUM_DEVICES = NUM_GPUS
-        if len(NUM_GPUS) > 1:
+        if NUM_GPUS > 1:
             USE_MULTIPROCESSING = 1
         else:
             USE_MULTIPROCESSING = 0
@@ -145,6 +145,8 @@ def main():
         return {'pixel_values': input}
 
     data_directory = args.data_path
+    if not data_directory.endswith('/'):
+        data_directory += '/'
     file_paths = os.listdir(data_directory)
     file_paths = [data_directory + file_path for file_path in file_paths]
     file_paths = random.sample(file_paths, len(file_paths))

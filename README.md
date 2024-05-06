@@ -9,14 +9,14 @@ The PyTorch version of FEMI can be found [here](https://github.com/surajraj99/FE
 ### Installation
 1. Create a new conda environment
 ```bash
-conda create -n femi python=3.10
+conda create -n femi python=3.9
 conda activate femi
 ```
 
 2. Install dependencies after clioning the repository
 ```bash
 git clone https://github.com/surajraj99/FEMI.git
-pip install -r requirements.txt
+pip install -r requirement.txt
 ```
 
 ### Pretrained Model Weights
@@ -41,11 +41,41 @@ Then run the following command to pretrain the model. The following command requ
 python main_pretrain.py \
 --data_path data \
 --batch_size 128 \
---num_epochs 100 \ 
+--epochs 100 \
 --output_dir output \
 --femi_model_path tf_femi \
 --device gpu \
 --GPUs '0,1,2,3'
+```
+
+If you train your own model from a FEMI checkpoint and want to convert it so that is compatible with Hugging Face, you can use the following:
+
+```bash
+from transformers import ViTMAEConfig, ViTMAEForPreTraining, TFViTMAEForPreTraining
+import shutil
+import os
+
+path_to_FEMI = <path_to_FEMI_model>
+path_new_tf_model_weights = <path_to_new_SSL_model_weights>
+path_new_model_hf = <location_to_save_new_model>
+model = TFViTMAEForPreTraining.from_pretrained(path_to_FEMI)
+model.load_weights(new_model_weights)
+print("Load tensorflow weights successfully")
+model.save_pretrained(path_new_model_hf)
+
+# Copying the preprocessor config file
+shutil.copyfile(os.path.join(path_to_FEMI, 'preprocessor_config.json'), os.path.join(path_new_model, 'preprocessor_config.json'))
+```
+
+To convert the FEMI to PyTorch, you can use the following:
+
+```bash
+from transformers import ViTMAEConfig, ViTMAEForPreTraining, ViTMAEForPreTraining
+
+path_to_FEMI = <path_to_FEMI_model>
+torch_path_to_save = <path_to_save_torch_model>
+model = ViTMAEForPreTraining.from_pretrained(path_to_FEMI, from_tf=True)
+model.save_pretrained(torch_path_to_save)
 ```
 
 ### Fine-Tuning With Your Own Data
@@ -85,7 +115,7 @@ python main_finetune.py \
 --data_path data \
 --csv_path data.csv \
 --batch_size 32 \
---num_epochs 100 \
+--epochs 100 \
 --output_dir output \
 --femi_model_path tf_femi \
 --device gpu \
@@ -100,7 +130,7 @@ python main_finetune.py \
 --data_path data \
 --csv_path data.csv \
 --batch_size 32 \
---num_epochs 100 \
+--epochs 100 \
 --output_dir output \
 --femi_model_path tf_femi \
 --device gpu \

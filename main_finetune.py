@@ -81,14 +81,14 @@ def get_args_parser():
     return parser
 
 
-def main():
-    if args.devide == 'gpu':
+def main(args):
+    if args.device == 'gpu':
         if args.GPUs is None:
             raise ValueError('GPUs must be specified when using GPU')
         os.environ['CUDA_VISIBLE_DEVICES'] = args.GPUs
         NUM_GPUS = len(args.GPUs.split(','))
         NUM_DEVICES = NUM_GPUS
-        if len(NUM_GPUS) > 1:
+        if NUM_GPUS > 1:
             USE_MULTIPROCESSING = 1
         else:
             USE_MULTIPROCESSING = 0
@@ -367,6 +367,8 @@ def main():
 
     # Train the model
     data_dir = args.data_path
+    if not data_dir.endswith('/'):
+        data_dir += '/'
     dir = [data_dir]
     df_data = internal_df.copy()
     df_data = df_data.sample(frac=1).reset_index(drop=True)
