@@ -50,8 +50,8 @@ python main_pretrain.py \
 
 If you train your own model from a FEMI checkpoint and want to convert it so that is compatible with Hugging Face, you can use the following:
 
-```bash
-from transformers import ViTMAEConfig, ViTMAEForPreTraining, TFViTMAEForPreTraining
+```python
+from transformers import TFViTMAEForPreTraining
 import shutil
 import os
 
@@ -69,8 +69,8 @@ shutil.copyfile(os.path.join(path_to_FEMI, 'preprocessor_config.json'), os.path.
 
 To convert the FEMI to PyTorch, you can use the following:
 
-```bash
-from transformers import ViTMAEConfig, ViTMAEForPreTraining, ViTMAEForPreTraining
+```python
+from transformers import ViTMAEForPreTraining
 
 path_to_FEMI = <path_to_FEMI_model>
 torch_path_to_save = <path_to_save_torch_model>
