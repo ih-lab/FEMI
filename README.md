@@ -4,8 +4,6 @@ This is the official repository for GEMI, a foundation model for embryology trai
 
 Please contact sur4002@med.cornell.edu or surajraj99@gmail.com if you have specific questions.
 
-The PyTorch version of GEMI can be found [here](https://github.com/surajraj99/GEMI-pytorch)
-
 ### Installation
 1. Create a new conda environment
 ```bash
