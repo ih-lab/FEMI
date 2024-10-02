@@ -59,8 +59,8 @@ def get_args_parser():
                         help='use reduce lr on plateau (default: True)')
 
     # * Finetuning params
-    parser.add_argument('--femi_model_path', default='',type=str,
-                        help='FEMI model path')
+    parser.add_argument('--gemi_model_path', default='',type=str,
+                        help='GEMI model path')
     parser.add_argument('--validation_split', default=0.2, type=float,
                         help='validation split percentage')
 
@@ -231,7 +231,7 @@ def main(args):
         if do_image_classification:
             inp = Input(shape=(224, 224, 3))
         
-        model = TFViTMAEForPreTraining.from_pretrained(args.femi_model_path)
+        model = TFViTMAEForPreTraining.from_pretrained(args.gemi_model_path)
         num_hidden_layers = 24
         model.config.mask_ratio = 0
         model.config.hidden_dropout_prob = 0.2
