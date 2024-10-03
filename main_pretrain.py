@@ -51,8 +51,8 @@ def get_args_parser():
                         help='save model every epoch (default: True)')
 
     # * Finetuning params
-    parser.add_argument('--gemi_model_path', default='',type=str,
-                        help='GEMI model path')
+    parser.add_argument('--femi_model_path', default='',type=str,
+                        help='FEMI model path')
     parser.add_argument('--validation_split', default=0.2, type=float,
                         help='validation split percentage')
 
@@ -187,18 +187,18 @@ def main(args):
     ### COMPILATION AND TRAINING
     print("Compiling the model...")
 
-    path_to_GEMI = args.gemi_model_path
+    path_to_FEMI = args.femi_model_path
 
     if USE_MULTIPROCESSING:
         strategy = tf.distribute.MirroredStrategy()
         print('Number of devices: {}'.format(strategy.num_replicas_in_sync))
         with strategy.scope():
-            model = TFViTMAEForPreTraining.from_pretrained(path_to_GEMI)
+            model = TFViTMAEForPreTraining.from_pretrained(path_to_FEMI)
             model.config.mask_ratio = args.mask_ratio
             optimizer = tf.keras.optimizers.AdamW(learning_rate=scheduled_lrs, weight_decay=WEIGHT_DECAY, beta_1=beta_1, beta_2=beta_2)
             model.compile(optimizer=optimizer, loss='auto', metrics=['mae'])
     else:
-        model = TFViTMAEForPreTraining.from_pretrained(path_to_GEMI)
+        model = TFViTMAEForPreTraining.from_pretrained(path_to_FEMI)
         model.config.mask_ratio = args.mask_ratio
         optimizer = tf.keras.optimizers.AdamW(learning_rate=scheduled_lrs, weight_decay=WEIGHT_DECAY, beta_1=beta_1, beta_2=beta_2)
         model.compile(optimizer=optimizer, loss='auto', metrics=['mae'])
