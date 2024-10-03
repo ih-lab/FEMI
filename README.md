@@ -1,19 +1,19 @@
-# GEMI
+# FEMI
 
-This is the official repository for GEMI, a foundation model for embryology trained on time-lapse images. This repository is written for TensorFlow.
+This is the official repository for FEMI, a foundation model for embryology trained on time-lapse images. This repository is written for TensorFlow.
 
 Please contact sur4002@med.cornell.edu or surajraj99@gmail.com if you have specific questions.
 
 ### Installation
 1. Create a new conda environment
 ```bash
-conda create -n gemi python=3.9
-conda activate gemi
+conda create -n femi python=3.9
+conda activate femi
 ```
 
 2. Install dependencies after clioning the repository
 ```bash
-git clone https://github.com/surajraj99/GEMI.git
+git clone https://github.com/surajraj99/FEMI.git
 pip install -r requirement.txt
 ```
 
@@ -23,7 +23,7 @@ The pretrained model weights can be requested by filling out the following surve
 The weights are compatible with the hugging face Tensorflow implementation if the ViT MAE. Information can be found [here](https://huggingface.co/docs/transformers/main/model_doc/vit_mae)
 
 ### Pretraining With Your Own Data
-You can further pretrain GEMI with your own large-scale IVF image dataset in an SSL setting. The code for pretraining can be found in the `main_pretrain.py` script.
+You can further pretrain FEMI with your own large-scale IVF image dataset in an SSL setting. The code for pretraining can be found in the `main_pretrain.py` script.
 
 To run pretraining, have your data in the following format:
 ```
@@ -33,7 +33,7 @@ data
 └───...
 ```
 
-Then run the following command to pretrain the model. The following command requires GPUs. If you do not have GPUs, you can remove the `--device gpu` flag and the `--GPUs` flag. Instead, use the `--device cpu` flag, which is not recommended for large-scale datasets. `--gemi_model_path` should point to the path of the pretrained model weights. All models will be save to the `--output_dir` directory.
+Then run the following command to pretrain the model. The following command requires GPUs. If you do not have GPUs, you can remove the `--device gpu` flag and the `--GPUs` flag. Instead, use the `--device cpu` flag, which is not recommended for large-scale datasets. `--femi_model_path` should point to the path of the pretrained model weights. All models will be save to the `--output_dir` directory.
 
 ```bash
 python main_pretrain.py \
@@ -41,43 +41,43 @@ python main_pretrain.py \
 --batch_size 128 \
 --epochs 100 \
 --output_dir output \
---gemi_model_path tf_gemi \
+--femi_model_path tf_femi \
 --device gpu \
 --GPUs '0,1,2,3'
 ```
 
-If you train your own model from a GEMI checkpoint and want to convert it so that is compatible with Hugging Face, you can use the following:
+If you train your own model from a FEMI checkpoint and want to convert it so that is compatible with Hugging Face, you can use the following:
 
 ```python
 from transformers import TFViTMAEForPreTraining
 import shutil
 import os
 
-path_to_GEMI = <path_to_GEMI_model>
+path_to_FEMI = <path_to_FEMI_model>
 path_new_tf_model_weights = <path_to_new_SSL_model_weights>
 path_new_model_hf = <location_to_save_new_model>
-model = TFViTMAEForPreTraining.from_pretrained(path_to_GEMI)
+model = TFViTMAEForPreTraining.from_pretrained(path_to_FEMI)
 model.load_weights(new_model_weights)
 print("Load tensorflow weights successfully")
 model.save_pretrained(path_new_model_hf)
 
 # Copying the preprocessor config file
-shutil.copyfile(os.path.join(path_to_GEMI, 'preprocessor_config.json'), os.path.join(path_new_model, 'preprocessor_config.json'))
+shutil.copyfile(os.path.join(path_to_FEMI, 'preprocessor_config.json'), os.path.join(path_new_model, 'preprocessor_config.json'))
 ```
 
-To convert the GEMI to PyTorch, you can use the following:
+To convert the FEMI to PyTorch, you can use the following:
 
 ```python
 from transformers import ViTMAEForPreTraining
 
-path_to_GEMI = <path_to_GEMI_model>
+path_to_FEMI = <path_to_FEMI_model>
 torch_path_to_save = <path_to_save_torch_model>
-model = ViTMAEForPreTraining.from_pretrained(path_to_GEMI, from_tf=True)
+model = ViTMAEForPreTraining.from_pretrained(path_to_FEMI, from_tf=True)
 model.save_pretrained(torch_path_to_save)
 ```
 
 ### Fine-Tuning With Your Own Data
-You can fine-tune GEMI with your own IVF image dataset in a supervised setting. The code for fine-tuning can be found in the `main_finetune.py` script. You can perform either classification or regression with the model. The model takes in wither image or videos.
+You can fine-tune FEMI with your own IVF image dataset in a supervised setting. The code for fine-tuning can be found in the `main_finetune.py` script. You can perform either classification or regression with the model. The model takes in wither image or videos.
 
 To perform fine-tuning, have your image and video data in the following format, where embryo1, embryo2, etc. are the embryo folders (unique ID numbers) and image1, image2, etc. are the image files:
 ```
@@ -106,7 +106,7 @@ embryo2, 0, 41
 
 The table should have a header row with the column names `SUBJECT_NO`, `LABEL`, and `AGE`. `SUBJECT_NO` should be the embryo folder name, `LABEL` should be the label for the embryo. If classification, the label should be either 0 or 1. If regression, the labels should be a value between 0 - 1. `AGE` only needs to be included if you want models to inlcude maternal age as a predictor `--use_age 1`.
 
-Then run the following command to fine-tune the model. The following command requires GPUs. If you do not have GPUs, you can remove the `--device gpu` flag and the `--GPUs` flag. Instead, use the `--device cpu` flag, which is not recommended for large-scale datasets. `--gemi_model_path` should point to the path of the pretrained model weights. All models will be save to the `--output_dir` directory.
+Then run the following command to fine-tune the model. The following command requires GPUs. If you do not have GPUs, you can remove the `--device gpu` flag and the `--GPUs` flag. Instead, use the `--device cpu` flag, which is not recommended for large-scale datasets. `--femi_model_path` should point to the path of the pretrained model weights. All models will be save to the `--output_dir` directory.
 
 ```bash
 python main_finetune.py \
@@ -115,7 +115,7 @@ python main_finetune.py \
 --batch_size 32 \
 --epochs 100 \
 --output_dir output \
---gemi_model_path tf_gemi \
+--femi_model_path tf_femi \
 --device gpu \
 --GPUs '0' \
 --do_binary_classification 1
@@ -130,7 +130,7 @@ python main_finetune.py \
 --batch_size 32 \
 --epochs 100 \
 --output_dir output \
---gemi_model_path tf_gemi \
+--femi_model_path tf_femi \
 --device gpu \
 --GPUs '0' \
 --use_age 1 \
