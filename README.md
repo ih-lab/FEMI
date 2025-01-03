@@ -4,8 +4,6 @@ This is the official repository for FEMI, a foundation model for embryology trai
 
 Please contact sur4002@med.cornell.edu or surajraj99@gmail.com if you have specific questions.
 
-The PyTorch version of FEMI can be found [here](https://github.com/surajraj99/FEMI-pytorch)
-
 ### Installation
 1. Create a new conda environment
 ```bash
@@ -20,9 +18,9 @@ pip install -r requirement.txt
 ```
 
 ### Pretrained Model Weights
-The pretrained model weights can be downloaded from [here]()
+The pretrained model weights can be accessed through [HuggingFace](https://huggingface.co/surajraj99/FEMI).
 
-The weights are compatible with the hugging face Tensorflow implementation if the ViT MAE. Information can be found [here](https://huggingface.co/docs/transformers/main/model_doc/vit_mae)
+The weights are compatible with the HuggingFace implementation of the ViT MAE. Information can be found [here](https://huggingface.co/docs/transformers/main/model_doc/vit_mae)
 
 ### Pretraining With Your Own Data
 You can further pretrain FEMI with your own large-scale IVF image dataset in an SSL setting. The code for pretraining can be found in the `main_pretrain.py` script.
@@ -54,6 +52,9 @@ If you train your own model from a FEMI checkpoint and want to convert it so tha
 from transformers import TFViTMAEForPreTraining
 import shutil
 import os
+from huggingface_hub import login
+
+login()
 
 path_to_FEMI = <path_to_FEMI_model>
 path_new_tf_model_weights = <path_to_new_SSL_model_weights>
@@ -65,17 +66,6 @@ model.save_pretrained(path_new_model_hf)
 
 # Copying the preprocessor config file
 shutil.copyfile(os.path.join(path_to_FEMI, 'preprocessor_config.json'), os.path.join(path_new_model, 'preprocessor_config.json'))
-```
-
-To convert the FEMI to PyTorch, you can use the following:
-
-```python
-from transformers import ViTMAEForPreTraining
-
-path_to_FEMI = <path_to_FEMI_model>
-torch_path_to_save = <path_to_save_torch_model>
-model = ViTMAEForPreTraining.from_pretrained(path_to_FEMI, from_tf=True)
-model.save_pretrained(torch_path_to_save)
 ```
 
 ### Fine-Tuning With Your Own Data
@@ -140,3 +130,8 @@ python main_finetune.py \
 --num_frames_in_vid 18 \
 --do_regression 1
 ```
+
+### Preprocessing Data for Foundation Model Training
+To preprocess your data for training with FEMI, you can use the `preprocess_data.py` script. This script will preprocess your data and save it in a format that can be used for training. The script adjusts the brightness and crops the images around the embryo.
+
+The script uses a segmentation model that requires PyTorch. If you choose not to preprocess images, you do not need PyTorch.
