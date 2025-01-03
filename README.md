@@ -130,3 +130,8 @@ python main_finetune.py \
 --num_frames_in_vid 18 \
 --do_regression 1
 ```
+
+### Preprocessing Data for Foundation Model Training
+To preprocess your data for training with FEMI, you can use the `preprocess_data.py` script. This script will preprocess your data and save it in a format that can be used for training. The script adjusts the brightness and crops the images around the embryo.
+
+The script uses a segmentation model that requires PyTorch. If you choose not to preprocess images, you do not need PyTorch.
