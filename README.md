@@ -14,6 +14,7 @@ conda activate femi
 2. Install dependencies after clioning the repository
 ```bash
 git clone https://github.com/surajraj99/FEMI.git
+cd FEMI
 pip install -r requirement.txt
 ```
 
