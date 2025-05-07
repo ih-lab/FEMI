@@ -2,7 +2,7 @@
 
 This is the official repository for FEMI, a foundation model for embryology trained on time-lapse images. This repository is written for TensorFlow.
 
-Please contact sur4002@med.cornell.edu or surajraj99@gmail.com if you have specific questions.
+Please contact sur4002@med.cornell.edu or imh2003@med.cornell.edu if you have specific questions.
 
 ### Installation
 1. Create a new conda environment
@@ -13,7 +13,7 @@ conda activate femi
 
 2. Install dependencies after clioning the repository
 ```bash
-git clone https://github.com/surajraj99/FEMI.git
+git clone https://github.com/ih-lab/FEMI.git
 cd FEMI
 pip install -r requirement.txt
 ```
