@@ -19,7 +19,7 @@ pip install -r requirement.txt
 ```
 
 ### Pretrained Model Weights
-The pretrained model weights can be accessed through [HuggingFace](https://huggingface.co/surajraj99/FEMI).
+The pretrained model weights can be accessed through [HuggingFace](https://huggingface.co/ihlab/FEMI).
 
 The weights are compatible with the HuggingFace implementation of the ViT MAE. Information can be found [here](https://huggingface.co/docs/transformers/main/model_doc/vit_mae)
 
