@@ -70,7 +70,7 @@ shutil.copyfile(os.path.join(path_to_FEMI, 'preprocessor_config.json'), os.path.
 ```
 
 ### Fine-Tuning With Your Own Data
-You can fine-tune FEMI with your own IVF image dataset in a supervised setting. The code for fine-tuning can be found in the `main_finetune.py` script. You can perform either classification or regression with the model. The model takes in wither image or videos.
+You can fine-tune FEMI with your own IVF image dataset in a supervised setting. The code for fine-tuning can be found in the `main_finetune.py` script. You can perform either classification or regression with the model. The model takes in either image or videos.
 
 To perform fine-tuning, have your image and video data in the following format, where embryo1, embryo2, etc. are the embryo folders (unique ID numbers) and image1, image2, etc. are the image files:
 ```
