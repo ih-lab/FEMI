@@ -151,34 +151,23 @@ def main(args):
 
 
     class IVFDataset(Sequence):
-        def __init__(self, folders, batch_size, df_labels, n_frames=18, target_size=(224, 224), 
-                    val_subsample_rate=1.0, batch_size_frac=None):
-            self.folders = folders
-            if batch_size_frac == 0: batch_size_frac = None
-            if batch_size_frac is None:
-                self.batch_size = batch_size
+        def __init__(self, data_path, batch_size, df_labels, n_frames=18, target_size=(224, 224)):
+            self.data_path = data_path
+            self.batch_size = batch_size
             self.n_frames = n_frames
             self.target_size = target_size
-            self.val_subsample_rate = val_subsample_rate
-            
+
             # Pre-compute labels
-            label_dicts = []
-            all_samples = []
-            for i, folder in enumerate(self.folders):
-                label_dict = df_labels[i].set_index('SUBJECT_NO').to_dict(orient='index')
-                label_dicts.append(label_dict)
-                samples = []
-                for dir_name in os.listdir(folder):
-                    if dir_name in label_dict and len(os.listdir(os.path.join(folder, dir_name))) > self.n_frames:
-                        samples.append(os.path.join(folder, dir_name))
-                all_samples.extend(samples)
-            self.samples = all_samples
-            if batch_size_frac is not None:
-                self.batch_size = int(len(self.samples) * batch_size_frac)
-            combined_dict = {}
-            for d in label_dicts:
-                combined_dict.update(d)
-            self.label_dict = combined_dict
+            # This dict can contains entries which folder is non-existent.
+            self.label_dict = df_labels.set_index('SUBJECT_NO').to_dict(orient='index')
+
+            samples = []
+            for dir_name in os.listdir(data_path):
+                embryo_path = os.path.join(data_path, dir_name)
+                # Include existing entries with a sufficient number of frames only
+                if dir_name in self.label_dict and len(os.listdir(embryo_path)) >= self.n_frames:
+                    samples.append(embryo_path)
+            self.samples = samples
 
         def __len__(self):
             return math.ceil(len(self.samples) / self.batch_size)
@@ -203,23 +192,22 @@ def main(args):
                         batch_images.append(img)
                     else:
                         images.append(img)            
-                
-                vid = tf.stack(images, axis=0)  
-                batch_images.append(vid)
+
+                if not do_image_classification:
+                    vid = tf.stack(images, axis=0)
+                    batch_images.append(vid)
                 # Use pre-computed labels
                 labels = self.label_dict[os.path.basename(sample)]
                 final_labels.append(labels.get('LABEL', 0))
                 if not exclude_age:
                     age_input.append(labels['AGE'] / 50)
 
-            if not exclude_age:
-                x = [np.array(batch_images), np.array(age_input)]
-            else:
-                x = [np.array(batch_images)]
-        
-            y = [np.array(final_labels)]
+            y = np.array(final_labels)
 
-            return x, y
+            if not exclude_age:
+                return (np.array(batch_images), np.array(age_input)), y
+
+            return np.array(batch_images), y
 
 
     def create_model_linear_probe():
@@ -314,18 +302,18 @@ def main(args):
         lr_metric = get_lr_metric(opt)
 
         if not exclude_age:
-            final_inputs = [inp, maternal_age]
+            final_inputs = (inp, maternal_age)
         else:
-            final_inputs = [inp]
+            final_inputs = inp
 
         if binary_classification_task:
-            final_outputs = [binary_model_output]
+            final_outputs = binary_model_output
             classification_loss = tf.keras.losses.BinaryCrossentropy(label_smoothing=0.1)
             final_loss = {'binary_output':classification_loss}
             final_metrics = {'binary_output':[tf.keras.metrics.AUC(name='auc'), lr_metric]}
             final_loss_weights = {'binary_output':1}
         elif regression_task:
-            final_outputs = [regression_model_output]
+            final_outputs = regression_model_output
             final_loss = {'regression_output':'logcosh'}
             final_metrics = {'regression_output':['mean_absolute_error', lr_metric]}
             final_loss_weights = {'regression_output':1}
@@ -368,20 +356,14 @@ def main(args):
     print("Training the model...")
 
     # Train the model
-    data_dir = args.data_path
-    if not data_dir.endswith('/'):
-        data_dir += '/'
-    dir = [data_dir]
     df_data = internal_df.copy()
     df_data = df_data.sample(frac=1).reset_index(drop=True)
     val_df = df_data.sample(frac=val_dataset_fraction, random_state=42)
     train_all_df = df_data.drop(val_df.index).reset_index(drop=True)
     val_df = val_df.reset_index(drop=True)
     train_df = train_all_df.reset_index(drop=True)
-    train_dfs = [train_df]
-    val_dfs = [val_df]
-    source_train_gen = IVFDataset(dir, BATCH_SIZE, train_dfs, n_frames=num_frames_in_vid)
-    source_val_gen = IVFDataset(dir, BATCH_SIZE, val_dfs, n_frames=num_frames_in_vid)
+    source_train_gen = IVFDataset(args.data_path, BATCH_SIZE, train_df, n_frames=num_frames_in_vid)
+    source_val_gen = IVFDataset(args.data_path, BATCH_SIZE, val_df, n_frames=num_frames_in_vid)
 
     if USE_MULTIPROCESSING:
         strategy = tf.distribute.MirroredStrategy()
