@@ -52,6 +52,17 @@ class WarmUpCosine(keras.optimizers.schedules.LearningRateSchedule):
             step > self.total_steps, 0.0, learning_rate, name="learning_rate"
         )
     
+class WarmupScheduler(tf.keras.callbacks.Callback):
+    def __init__(self, warmup_epochs, target_lr):
+        super(WarmupScheduler, self).__init__()
+        self.warmup_epochs = warmup_epochs
+        self.target_lr = target_lr
+
+    def on_epoch_begin(self, epoch, logs=None):
+        if epoch < self.warmup_epochs:
+            new_lr = self.target_lr * (epoch + 1) / self.warmup_epochs
+            tf.keras.backend.set_value(self.model.optimizer.lr, new_lr)
+            print(f"\nWarmup: Learning rate set to {new_lr:.6f}")
 
 class CustomReduceLROnPlateau(tf.keras.callbacks.Callback):
     def __init__(self, monitor='val_loss', factor=0.1, patience=5, verbose=1, mode='min', min_lr=1e-6):
