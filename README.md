@@ -2,7 +2,7 @@
 
 This is the official repository for FEMI, a foundation model for embryology trained on time-lapse images. This repository is written for TensorFlow.
 
-Please contact sur4002@med.cornell.edu or surajraj99@gmail.com if you have specific questions.
+Please contact sur4002@med.cornell.edu or imh2003@med.cornell.edu if you have specific questions.
 
 ### Installation
 1. Create a new conda environment
@@ -13,13 +13,13 @@ conda activate femi
 
 2. Install dependencies after clioning the repository
 ```bash
-git clone https://github.com/surajraj99/FEMI.git
+git clone https://github.com/ih-lab/FEMI.git
 cd FEMI
 pip install -r requirement.txt
 ```
 
 ### Pretrained Model Weights
-The pretrained model weights can be accessed through [HuggingFace](https://huggingface.co/surajraj99/FEMI).
+The pretrained model weights can be accessed through [HuggingFace](https://huggingface.co/ihlab/FEMI).
 
 The weights are compatible with the HuggingFace implementation of the ViT MAE. Information can be found [here](https://huggingface.co/docs/transformers/main/model_doc/vit_mae)
 
@@ -70,7 +70,7 @@ shutil.copyfile(os.path.join(path_to_FEMI, 'preprocessor_config.json'), os.path.
 ```
 
 ### Fine-Tuning With Your Own Data
-You can fine-tune FEMI with your own IVF image dataset in a supervised setting. The code for fine-tuning can be found in the `main_finetune.py` script. You can perform either classification or regression with the model. The model takes in wither image or videos.
+You can fine-tune FEMI with your own IVF image dataset in a supervised setting. The code for fine-tuning can be found in the `main_finetune.py` script. You can perform either classification or regression with the model. The model takes in either image or videos.
 
 To perform fine-tuning, have your image and video data in the following format, where embryo1, embryo2, etc. are the embryo folders (unique ID numbers) and image1, image2, etc. are the image files:
 ```

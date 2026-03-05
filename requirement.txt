@@ -1,8 +1,8 @@
-numpy==1.24.3
-openpyxl==3.1.2
+numpy==1.26.4
+openpyxl==3.1.5
 opencv-python==4.10.0.84
-pandas==1.5.3
+pandas==2.2.2
 pillow==10.4.0
-tensorflow==2.13.0
+tensorflow==2.15.1
 torch==2.3.0
-transformers==4.33.2
+transformers==4.44.2
