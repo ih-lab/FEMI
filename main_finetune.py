@@ -22,7 +22,7 @@ from tensorflow.keras.models import Model
 from tensorflow.keras.utils import Sequence
 from transformers import TFViTMAEForPreTraining
 
-from utils.helpers import set_trainable_recursively, get_lr_metric, CustomReduceLROnPlateau, AttentionWithContext, Addition
+from utils.helpers import set_trainable_recursively, get_lr_metric, CustomReduceLROnPlateau, AttentionWithContext, Addition, WarmupScheduler
 
 import warnings
 warnings.filterwarnings("ignore")
@@ -57,6 +57,10 @@ def get_args_parser():
                         help='number of frames in video (default: 1)')
     parser.add_argument('--use_reduce_lr_on_plateau', type=int, default=True,
                         help='use reduce lr on plateau (default: True)')
+    parser.add_argument('--warmup_epochs', type=int, default=5,
+                        help='number of warmup epochs')
+    parser.add_argument('--reduce_lr_factor', type=float, default=0.2,
+                        help='factor by which the learning rate will be reduced')
 
     # * Finetuning params
     parser.add_argument('--femi_model_path', default='',type=str,
@@ -139,6 +143,8 @@ def main(args):
     LEARNING_RATE = BASE_LEARNING_RATE * NUM_DEVICES
     PATIENCE = 10
     RESTORE_BEST_WEIGHTS = True
+    NUM_EPOCHS_WARMUP = args.warmup_epochs
+    REDUCE_LR_FACTOR = args.reduce_lr_factor
     if args.use_reduce_lr_on_plateau:
         REDUCE_LR_PATIENCE = 5
         REDUCE_LR_FACTOR = 0.1
@@ -205,7 +211,7 @@ def main(args):
             y = np.array(final_labels)
 
             if not exclude_age:
-                return (np.array(batch_images), np.array(age_input)), y
+                return [np.array(batch_images), np.array(age_input)], y
 
             return np.array(batch_images), y
 
@@ -214,6 +220,7 @@ def main(args):
         he_initializer = tf.keras.initializers.HeNormal()
         normal_initializer = tf.keras.initializers.TruncatedNormal(mean=0., stddev=0.01)
         inp = Input(shape=(None, 224, 224, 3))
+
         maternal_age = Input(shape=(1,))
         age_features = layers.Dense(10, activation='relu', name='age_dense_1', kernel_initializer=he_initializer)(maternal_age)
         if do_image_classification:
@@ -302,7 +309,7 @@ def main(args):
         lr_metric = get_lr_metric(opt)
 
         if not exclude_age:
-            final_inputs = (inp, maternal_age)
+            final_inputs = [inp, maternal_age]
         else:
             final_inputs = inp
 
@@ -339,6 +346,8 @@ def main(args):
     internal_df['SUBJECT_NO'] = internal_df['SUBJECT_NO'].astype(str)
     internal_df['LABEL'] = internal_df['LABEL'].astype(int)
 
+    # Define warmup scheduler callback
+    warmup_callback = WarmupScheduler(warmup_epochs=NUM_EPOCHS_WARMUP, target_lr=LEARNING_RATE)
 
     # Define early stopping callback
     early_stopping = EarlyStopping(monitor='val_loss', patience=PATIENCE, restore_best_weights=RESTORE_BEST_WEIGHTS)
@@ -349,9 +358,9 @@ def main(args):
 
     if args.use_reduce_lr_on_plateau:
         reduce_lr = CustomReduceLROnPlateau(monitor='val_loss', factor=REDUCE_LR_FACTOR, patience=REDUCE_LR_PATIENCE)
-        callbacks = [early_stopping, reduce_lr]
+        callbacks = [early_stopping, reduce_lr, warmup_callback]
     else:
-        callbacks = [early_stopping]
+        callbacks = [early_stopping, warmup_callback]
 
     print("Training the model...")
 
