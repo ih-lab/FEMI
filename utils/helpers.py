@@ -1,3 +1,12 @@
+# --------------------------------------------------------------------------
+# utils/helpers.py
+#
+# Shared TensorFlow/Keras utility classes used by both main_pretrain.py and
+# main_finetune.py: custom learning-rate schedules/callbacks, a small
+# metric helper, and custom Keras layers used for the video/temporal
+# fine-tuning path (attention-based pooling over per-frame features).
+# --------------------------------------------------------------------------
+
 import os
 import numpy as np
 from tensorflow import keras
@@ -12,6 +21,19 @@ import tensorflow.keras.backend as K
 
 
 class WarmUpCosine(keras.optimizers.schedules.LearningRateSchedule):
+    """
+    Learning rate schedule combining linear warmup with cosine decay.
+
+    - For the first `warmup_steps` steps, the LR ramps up linearly from
+      `warmup_learning_rate` to `learning_rate_base`.
+    - After warmup, the LR follows a cosine curve down from
+      `learning_rate_base` towards 0 as `step` approaches `total_steps`.
+    - Beyond `total_steps`, the LR is clamped to 0.
+
+    Used as the `learning_rate` argument to an optimizer (e.g. AdamW) in
+    main_pretrain.py, where TensorFlow calls this schedule's `__call__`
+    once per training step, passing in the current global step.
+    """
     def __init__(
         self, learning_rate_base, total_steps, warmup_learning_rate, warmup_steps
     ):
@@ -25,9 +47,14 @@ class WarmUpCosine(keras.optimizers.schedules.LearningRateSchedule):
         
 
     def __call__(self, step):
+        # Called by the optimizer/TF graph once per training step with the
+        # current global step count; must return the LR to use for that step.
         if self.total_steps < self.warmup_steps:
             raise ValueError("Total_steps must be larger or equal to warmup_steps.")
 
+        # Standard cosine annealing formula: oscillates from
+        # learning_rate_base (at step == warmup_steps) down to 0 (at
+        # step == total_steps).
         cos_annealed_lr = tf.cos(
             self.pi
             * (tf.cast(step, tf.float32) - self.warmup_steps)
@@ -45,26 +72,46 @@ class WarmUpCosine(keras.optimizers.schedules.LearningRateSchedule):
                 self.learning_rate_base - self.warmup_learning_rate
             ) / self.warmup_steps
             warmup_rate = slope * tf.cast(step, tf.float32) + self.warmup_learning_rate
+            # Use the linear warmup rate while step < warmup_steps, and the
+            # cosine-annealed rate afterwards.
             learning_rate = tf.where(
                 step < self.warmup_steps, warmup_rate, learning_rate
             )
+        # Force LR to exactly 0 once training has run past total_steps
+        # (shouldn't normally happen, but guards against edge cases).
         return tf.where(
             step > self.total_steps, 0.0, learning_rate, name="learning_rate"
         )
     
 class WarmupScheduler(tf.keras.callbacks.Callback):
+    """
+    Simple EPOCH-based (rather than step-based) linear warmup callback,
+    used in main_finetune.py. During the first `warmup_epochs` epochs, the
+    optimizer's learning rate is linearly ramped from ~0 up to `target_lr`;
+    afterwards this callback no longer touches the LR (any subsequent decay
+    is handled separately, e.g. by CustomReduceLROnPlateau below).
+    """
     def __init__(self, warmup_epochs, target_lr):
         super(WarmupScheduler, self).__init__()
         self.warmup_epochs = warmup_epochs
         self.target_lr = target_lr
 
     def on_epoch_begin(self, epoch, logs=None):
+        # Keras calls this automatically before each epoch starts.
         if epoch < self.warmup_epochs:
             new_lr = self.target_lr * (epoch + 1) / self.warmup_epochs
             tf.keras.backend.set_value(self.model.optimizer.lr, new_lr)
             print(f"\nWarmup: Learning rate set to {new_lr:.6f}")
 
 class CustomReduceLROnPlateau(tf.keras.callbacks.Callback):
+    """
+    Custom reimplementation of Keras' built-in ReduceLROnPlateau, with one
+    key difference: whenever the LR is reduced due to a plateau, this
+    callback ALSO restores the model's weights to the best ones seen so
+    far (like a mini "restore_best_weights" applied at every LR drop, not
+    just once at the very end of training). This helps avoid continuing to
+    train from a degraded state before the LR reduction kicks in.
+    """
     def __init__(self, monitor='val_loss', factor=0.1, patience=5, verbose=1, mode='min', min_lr=1e-6):
         super(CustomReduceLROnPlateau, self).__init__()
 
@@ -84,6 +131,8 @@ class CustomReduceLROnPlateau(tf.keras.callbacks.Callback):
         self.wait = 0
 
     def on_epoch_end(self, epoch, logs=None):
+        # Keras calls this automatically after each epoch, with `logs`
+        # containing the epoch's metrics (including the monitored one).
         current = logs.get(self.monitor)
         if self.mode == 'min':
             comparison = np.less
@@ -112,6 +161,13 @@ class CustomReduceLROnPlateau(tf.keras.callbacks.Callback):
 
 
 def get_lr_metric(optimizer):
+    """
+    Returns a Keras-metric-compatible function that reports the
+    optimizer's CURRENT learning rate at each step/epoch. This is a
+    common trick to make the live LR value show up in Keras' training logs
+    and `history` object alongside loss/accuracy, purely for monitoring
+    (it doesn't affect training in any way).
+    """
     def lr(y_true, y_pred):
         curLR = optimizer.lr
         return curLR
@@ -198,12 +254,18 @@ class AttentionWithContext(Layer):
         return None
 
     def call(self, x, mask=None):
+        # x: (batch, timesteps, features) - one feature vector per frame.
+        # Step 1: project each timestep through a learned Dense-like
+        # transform (W, b) and squash with tanh -> u_t = tanh(W h_t + b).
         uit = dot_product(x, self.W)
 
         if self.bias:
             uit += self.b
 
         uit = K.tanh(uit)
+        # Step 2: score each timestep's relevance against a learned context
+        # vector `u` via dot product, then softmax-normalize (exp + divide
+        # by sum below) across the time axis to get attention weights.
         ait = dot_product(uit, self.u)
 
         a = K.exp(ait)
@@ -219,6 +281,11 @@ class AttentionWithContext(Layer):
         a /= K.cast(K.sum(a, axis=1, keepdims=True) + K.epsilon(), K.floatx())
 
         a = K.expand_dims(a)
+        # Step 3: scale each timestep's original feature vector by its
+        # attention weight (v_t = alpha_t * h_t). The actual summation
+        # across time (producing the final pooled vector) happens in the
+        # separate Addition layer below, so callers can access the
+        # per-timestep weighted features/weights if needed.
         weighted_input = x * a
 
         return weighted_input, a

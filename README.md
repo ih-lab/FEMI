@@ -136,3 +136,19 @@ python main_finetune.py \
 To preprocess your data for training with FEMI, you can use the `preprocess_data.py` script. This script will preprocess your data and save it in a format that can be used for training. The script adjusts the brightness and crops the images around the embryo.
 
 The script uses a segmentation model that requires PyTorch. If you choose not to preprocess images, you do not need PyTorch.
+
+#### Running just the segmenter on a few images (no TensorFlow required)
+
+If you only want to test the embryo segmenter itself (e.g. to inspect masks/crops on a handful of problematic images) without installing TensorFlow/transformers, install the lighter dependency set and use `run_segmenter_inspect.py`:
+
+```bash
+cd preprocessing
+python -m venv .venv-segmenter && source .venv-segmenter/bin/activate
+pip install -r EmbryoSegmenter/requirements-segmenter.txt --index-url https://download.pytorch.org/whl/cpu --extra-index-url https://pypi.org/simple
+
+python run_segmenter_inspect.py path/to/image1.png path/to/image2.png
+# or process every image in a folder:
+python run_segmenter_inspect.py --input-dir path/to/raw_images --output-dir out/
+```
+
+For each image, this saves the resized input, the raw model mask, the mask after circularity filtering, a bounding-box overlay, and the final cropped output, plus prints diagnostics (fallback triggers, crop-area fraction, border-touching) useful for auditing segmentation quality. See `SEGMENTER_ACCURACY_ROADMAP.md` for what these diagnostics mean and known failure modes.

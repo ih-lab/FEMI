@@ -1,3 +1,30 @@
+# --------------------------------------------------------------------------
+# main_pretrain.py
+#
+# Entry point for SELF-SUPERVISED PRETRAINING of the FEMI foundation model
+# on your own (unlabeled) large-scale IVF/embryo image dataset. This uses
+# the Masked Autoencoder (MAE) objective via HuggingFace's
+# `TFViTMAEForPreTraining`: random patches of each image are masked out, and
+# the model is trained to reconstruct the missing pixels. This does NOT
+# require any labels/CSV file - just a folder of images (see README).
+#
+# Typical usage: continue pretraining from an existing FEMI checkpoint
+# (`--femi_model_path`) on new unlabeled data, producing an updated
+# self-supervised model that can later be fine-tuned (see
+# main_finetune.py) for a specific downstream task (e.g. classification).
+#
+# High-level flow of `main()`:
+#   1. Parse CLI args and configure GPU/CPU + distribution strategy.
+#   2. Build a tf.data.Dataset pipeline that reads image files from disk,
+#      normalizes them (ImageNet mean/std), optionally augments them, and
+#      batches/prefetches them for training.
+#   3. Build a cosine learning-rate schedule with linear warmup.
+#   4. Load the pretrained FEMI weights and compile the MAE model
+#      (optionally wrapped in a `MirroredStrategy` for multi-GPU training).
+#   5. Train with early stopping + per-epoch checkpointing.
+#   6. Save the final trained weights to `--output_dir`.
+# --------------------------------------------------------------------------
+
 from tensorflow import keras
 import tensorflow as tf
 import os
@@ -16,6 +43,8 @@ from keras.callbacks import EarlyStopping
 from transformers import TFViTMAEForPreTraining
 import random
 
+# WarmUpCosine implements a linear-warmup + cosine-decay learning rate
+# schedule; see utils/helpers.py for the full implementation.
 from utils.helpers import WarmUpCosine
 
 import warnings
@@ -23,6 +52,9 @@ warnings.filterwarnings("ignore")
 
 
 def get_args_parser():
+    """Define and return the argparse parser for all pretraining CLI flags
+    (batch size, learning rate schedule, dataset paths, device config,
+    etc.). See README.md for example commands."""
     parser = argparse.ArgumentParser('MAE fine-tuning for image classification', add_help=False)
     parser.add_argument('--batch_size', default=64, type=int,
                         help='Batch size per GPU (effective batch size is batch_size * accum_iter * # gpus')
@@ -72,6 +104,13 @@ def get_args_parser():
 
 
 def main(args):
+    # ------------------------------------------------------------------
+    # Device setup: restrict visible GPUs via CUDA_VISIBLE_DEVICES and
+    # decide whether to use TensorFlow's MirroredStrategy for synchronous
+    # multi-GPU data-parallel training (only when more than 1 GPU is
+    # requested). CPU-only training is supported but not recommended for
+    # large datasets (per README).
+    # ------------------------------------------------------------------
     if args.device == 'gpu':
         if args.GPUs is None:
             raise ValueError('GPUs must be specified when using GPU')
@@ -107,6 +146,8 @@ def main(args):
 
     INPUT_SHAPE = (224, 224, 3)
 
+    # Images are normalized using standard ImageNet mean/std statistics
+    # (since FEMI's ViT backbone was originally pretrained in that regime).
     imagenet_mean = tf.constant([0.485, 0.456, 0.406], dtype=tf.float32)
     imagenet_std = tf.constant([0.229, 0.224, 0.225], dtype=tf.float32)
     mean = tf.reshape(imagenet_mean, [1, 1, 3])
@@ -114,6 +155,11 @@ def main(args):
 
 
     def process_path(file_path):
+        """tf.data map function: read one image file from disk, resize to
+        224x224, normalize with ImageNet mean/std, and transpose to
+        channels-first (3, 224, 224) layout expected by the HuggingFace
+        ViTMAE model. Returns a dict matching the model's expected input
+        signature (`pixel_values`)."""
         image = tf.io.read_file(file_path)
         img = tf.io.decode_image(image, channels=3)
         img.set_shape([None, None, 3])
@@ -125,6 +171,9 @@ def main(args):
         return {'pixel_values': input}
 
     def process_path_aug(file_path):
+        """Same as process_path, but applies simple data augmentation
+        (resize-then-random-crop + random horizontal flip) before
+        normalizing. Used when --data_augmentation is enabled."""
         image = tf.io.read_file(file_path)
         img = tf.io.decode_image(image, channels=3)
         img.set_shape([None, None, 3])
@@ -144,6 +193,9 @@ def main(args):
         input.set_shape([3, 224, 224])
         return {'pixel_values': input}
 
+    # List every file under --data_path and shuffle the file paths up front
+    # (random.sample with the full length effectively shuffles in place)
+    # before doing the train/val split, so the split is randomized.
     data_directory = args.data_path
     if not data_directory.endswith('/'):
         data_directory += '/'
@@ -164,6 +216,10 @@ def main(args):
     print("Number of training files: ", train_dataset_size)
     print("Number of validation files: ", len(file_paths) - train_dataset_size)
 
+    # Build the input pipelines: shuffle (train only) -> decode/normalize
+    # (optionally augment) -> batch -> prefetch. `num_parallel_calls=AUTO`
+    # and `.prefetch(AUTO)` let TensorFlow automatically tune parallelism
+    # so that data loading overlaps with GPU/CPU compute.
     print("Loading training dataset...")
     if USE_DATA_AUG:
         train_ds = train_dataset.shuffle(BUFFER_SIZE).map(process_path_aug, num_parallel_calls=AUTO).batch(GLOBAL_BATCH_SIZE).prefetch(AUTO)
@@ -173,6 +229,10 @@ def main(args):
         val_ds = val_dataset.map(process_path, num_parallel_calls=AUTO).batch(GLOBAL_BATCH_SIZE).prefetch(AUTO)
     print("Mapping done...")
         
+    # Compute the total number of optimizer steps (batches) across all
+    # epochs, and how many of those steps fall within the warmup period, so
+    # the WarmUpCosine schedule below knows when to transition from linear
+    # warmup to cosine decay.
     print("Size of training dataset: ", train_dataset_size)
     total_steps = int((train_dataset_size / GLOBAL_BATCH_SIZE) * EPOCHS)
     print(f"Total steps: {total_steps}")
@@ -189,6 +249,10 @@ def main(args):
 
     path_to_FEMI = args.femi_model_path
 
+    # When training across multiple GPUs, `MirroredStrategy` replicates the
+    # model on each device and synchronously averages gradients each step
+    # (data parallelism). Model creation/compilation must happen inside
+    # `strategy.scope()` for this to work correctly.
     if USE_MULTIPROCESSING:
         strategy = tf.distribute.MirroredStrategy()
         print('Number of devices: {}'.format(strategy.num_replicas_in_sync))
@@ -203,8 +267,13 @@ def main(args):
         optimizer = tf.keras.optimizers.AdamW(learning_rate=scheduled_lrs, weight_decay=WEIGHT_DECAY, beta_1=beta_1, beta_2=beta_2)
         model.compile(optimizer=optimizer, loss='auto', metrics=['mae'])
 
+    # Stop training if validation loss stops improving for
+    # `early_stopping_patience` epochs, restoring the best-seen weights.
     early_stopping = EarlyStopping(monitor='val_loss', patience=args.early_stopping_patience, restore_best_weights=True)
 
+    # Optionally checkpoint weights after every single epoch (in addition
+    # to the final save below), which is useful for resuming interrupted
+    # runs or picking an earlier epoch if overfitting sets in.
     if args.save_every_epoch:
         filepath = args.output_dir + '/' + args.output_model_name + "-{epoch:02d}" + "/ckpt"
         model_checkpoint_callback = tf.keras.callbacks.ModelCheckpoint(
@@ -227,13 +296,16 @@ def main(args):
         train_ds, epochs=EPOCHS, validation_data=val_ds, verbose=1, callbacks=train_callbacks
     )
 
-    # Save model
+    # Save the final model weights (in addition to any per-epoch
+    # checkpoints saved above) once training completes or early-stops.
     filepath = args.output_dir + '/' + args.output_model_name + "-final" + "/ckpt"
     model.save_weights(filepath)
     print("Training done...")
 
 
 if __name__ == '__main__':
+    # Script entry point: parse CLI args, ensure the output directory
+    # exists, then kick off pretraining.
     args = get_args_parser()
     args = args.parse_args()
 
