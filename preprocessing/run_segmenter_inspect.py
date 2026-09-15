@@ -12,26 +12,37 @@ listed in `EmbryoSegmenter/requirements-segmenter.txt` (torch, numpy,
 pillow, opencv). See that file / the README section on running this
 script for setup instructions.
 
-The segmentation + contour-filtering + fallback logic below intentionally
-mirrors `process_image()` in `preprocessing_images.py` byte-for-byte in
-behavior (including the known "union of all circularity-passing contours"
-issue described in SEGMENTER_ACCURACY_ROADMAP.md), so that what you see
-here matches what production actually does today. It is duplicated rather
-than imported because `preprocessing_images.py` runs directory-listing and
-model-loading side effects at import time (it's a script, not a library).
+The segmentation logic below started as a byte-for-byte mirror of
+`process_image()` in `preprocessing_images.py`, but the contour-selection
+step now implements the "Phase 1" fix from SEGMENTER_ACCURACY_ROADMAP.md
+(root causes A/B) instead of reproducing the production bug: rather than
+unioning every contour whose *circularity* clears a threshold, it picks a
+single best-candidate contour using border-rejection + a plausible-size
+cap + centrality — no circularity check at all. Circularity was
+deliberately dropped as a criterion entirely (not just softened): many
+real embryos (hatching, multi-cell/blastomere stage) are not close to
+circular, so shape-based scoring is an unreliable filter, whereas "is
+this contour touching the image border / implausibly large" cheaply and
+reliably distinguishes a dish rim or light vignette from an embryo
+without assuming anything about embryo shape. See `select_best_contour()`
+below and SEGMENTER_ACCURACY_ROADMAP.md Option C item 1 for the reasoning.
+This script is duplicated from (not imported from) `preprocessing_images.py`
+because that script runs directory-listing and model-loading side effects
+at import time (it's a script, not a library) — production still uses the
+old circularity-union logic until that fix is ported over there too.
 
 For each input image, this script saves 6 files to --output-dir:
   <stem>_1_input.png              the 224x224 resized image actually fed to the model
-  <stem>_2_raw_mask.png           the raw thresholded model mask (before contour filtering)
-  <stem>_3_filtered_mask.png      the mask after circularity filtering (matches production)
+  <stem>_2_raw_mask.png           the raw thresholded model mask (before contour selection)
+  <stem>_3_filtered_mask.png      the mask after best-candidate contour selection (fixed
+                                   logic — see module docstring; no longer matches
+                                   production's circularity-union behavior)
   <stem>_4_bbox_overlay.png       the input image with the final crop box drawn in red
-  <stem>_5_cropped_224.png        the final cropped + resized output EXACTLY as
-                                   preprocessing_images.py produces it today — including
-                                   its non-aspect-ratio-preserving resize (see root cause F
-                                   in SEGMENTER_ACCURACY_ROADMAP.md). If the bounding box
-                                   isn't square, THIS OUTPUT WILL BE VISIBLY STRETCHED/WARPED.
-                                   That is a genuine production bug, not an artifact of this
-                                   inspection tool - see `bbox_aspect_ratio` in the printed
+  <stem>_5_cropped_224.png        the final cropped + resized output using the SAME
+                                   non-aspect-ratio-preserving resize production uses today
+                                   (see root cause F in SEGMENTER_ACCURACY_ROADMAP.md). If the
+                                   bounding box isn't square, THIS OUTPUT WILL BE VISIBLY
+                                   STRETCHED/WARPED — see `bbox_aspect_ratio` in the printed
                                    diagnostics below.
   <stem>_6_cropped_224_fixed.png  the SAME crop, but squared up (padded to a square, centered
                                    on the original box, clamped to image bounds) BEFORE
@@ -43,14 +54,19 @@ It also prints per-image diagnostics that mirror the "Phase 0"
 instrumentation recommended in SEGMENTER_ACCURACY_ROADMAP.md:
   - whether the brightness-correction fallback triggered
   - whether the "give up, use full image" fallback triggered
-  - fraction of the 224x224 frame covered by the final bounding box
-    (a high fraction, e.g. >85%, is a proxy for the "dish rim / light
-    vignette mistaken for the embryo" failure mode)
+  - fraction of the 224x224 frame covered by the final bounding box, and
+    whether it exceeds 70% (`possible_background_false_positive`) — a
+    proxy for the "dish rim / light vignette mistaken for the embryo"
+    failure mode; a crop that large is most likely a faulty detection
+    rather than a genuinely embryo-filling frame
   - whether the final bounding box touches the image border (a proxy for
     either model under-recall or a genuinely clipped source image)
   - bbox_aspect_ratio (width/height of the crop box) and whether it's far
     enough from 1.0 to cause visible stretching in the production-faithful
     _5 output once force-resized to a 224x224 square
+  - selected_contour_circularity: circularity of the chosen contour,
+    reported purely for diagnostic/manual-review purposes — it is NOT
+    used to select or reject the contour
 
 Usage:
     python run_segmenter_inspect.py path/to/image1.png path/to/image2.jpg
@@ -113,7 +129,11 @@ def segment_image(model, frame):
 
 
 def calculate_circularity(contour):
-    """Identical to preprocessing_images.py."""
+    """Same formula as preprocessing_images.py, but here it is used ONLY
+    to report a diagnostic value for whichever contour
+    `select_best_contour` ends up choosing — it does not influence that
+    choice. (Production's original use of this function to filter/threshold
+    contours has been replaced; see module docstring.)"""
     area = cv2.contourArea(contour)
     perimeter = cv2.arcLength(contour, True)
     if perimeter == 0:
@@ -166,21 +186,76 @@ def find_bounding_box(mask):
     return (min_x, min_y, max_x, max_y)
 
 
-def filter_mask_by_circularity(mask, min_circularity):
-    """Reproduces the CURRENT production contour-filtering logic exactly:
-    finds external contours, keeps every one whose circularity clears the
-    threshold, and draws ALL of them (union, not just the single best
-    candidate) onto the final mask. See SEGMENTER_ACCURACY_ROADMAP.md
-    root causes A/B for why this union behavior is a likely source of the
-    "dish rim treated as embryo" and "irregular embryo excluded" failure
-    modes — this tool deliberately keeps that behavior so what you observe
-    here matches production, rather than a hypothetical fixed version."""
+def select_best_contour(mask, max_area_frac=0.9, border_margin=2):
+    """
+    Fixed replacement for production's `filter_mask_by_circularity`
+    (root causes A/B in SEGMENTER_ACCURACY_ROADMAP.md). Instead of taking
+    the UNION of every contour whose *circularity* clears a hard
+    threshold, this picks a SINGLE best-candidate contour, and does not
+    use circularity at all:
+
+      1. Find all external contours in the raw thresholded mask.
+      2. Prefer contours that (a) do NOT touch/nearly touch the image
+         border, and (b) are not implausibly large (> `max_area_frac` of
+         the frame). A petri dish rim or the microscope's light vignette
+         almost always trips at least one of these checks; a real embryo
+         (even off-center) usually trips neither. Unlike circularity,
+         this makes no assumption about the embryo's shape, so it works
+         equally well for round, hatching, or multi-cell embryos.
+      3. Among the surviving candidates (or, if none survive, among ALL
+         candidates — border-touching is a strong signal but not treated
+         as an absolute veto, since a genuinely off-center/edge-framed
+         embryo should still be picked over nothing), choose the one with
+         the LARGEST area, breaking ties by proximity to the frame center.
+         Larger area is used as a proxy for "most complete detected
+         region" (real embryo detections are typically much larger than
+         stray noise fragments).
+      4. Draw ONLY that one contour (filled) onto the output mask — no
+         union with any other contour.
+
+    Returns (final_mask, selected_contour) where final_mask matches the
+    input mask's shape/dtype convention (float, 0.0/1.0) and
+    selected_contour is None if no contour was found at all.
+    """
     cv2mask = (mask * 255).astype(np.uint8)
+    h, w = cv2mask.shape[:2]
     contours, _ = cv2.findContours(cv2mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    circular_contours = [cnt for cnt in contours if calculate_circularity(cnt) > min_circularity]
     final_mask = np.zeros_like(cv2mask)
-    cv2.drawContours(final_mask, circular_contours, -1, (255,), thickness=cv2.FILLED)
-    return (final_mask / 255.0).astype(float)
+
+    candidates = [cnt for cnt in contours if cv2.contourArea(cnt) > 0]
+    if not candidates:
+        return (final_mask / 255.0).astype(float), None
+
+    frame_area = float(w * h)
+    frame_cx, frame_cy = w / 2.0, h / 2.0
+
+    def touches_border(cnt):
+        x, y, bw, bh = cv2.boundingRect(cnt)
+        return (x <= border_margin or y <= border_margin
+                or (x + bw) >= (w - border_margin) or (y + bh) >= (h - border_margin))
+
+    def centroid(cnt):
+        m = cv2.moments(cnt)
+        if m["m00"] == 0:
+            x, y, bw, bh = cv2.boundingRect(cnt)
+            return x + bw / 2.0, y + bh / 2.0
+        return m["m10"] / m["m00"], m["m01"] / m["m00"]
+
+    preferred = [
+        cnt for cnt in candidates
+        if not touches_border(cnt) and cv2.contourArea(cnt) <= max_area_frac * frame_area
+    ]
+    pool = preferred if preferred else candidates
+
+    def score(cnt):
+        area = cv2.contourArea(cnt)
+        ccx, ccy = centroid(cnt)
+        dist_from_center = np.hypot(ccx - frame_cx, ccy - frame_cy)
+        return (area, -dist_from_center)  # largest area first, then closest to center
+
+    best = max(pool, key=score)
+    cv2.drawContours(final_mask, [best], -1, (255,), thickness=cv2.FILLED)
+    return (final_mask / 255.0).astype(float), best
 
 
 def squarify_bbox(min_x, min_y, max_x, max_y, img_w, img_h):
@@ -234,7 +309,8 @@ def to_bgr_uint8(img):
     return cv2.cvtColor(arr[:, :, 0], cv2.COLOR_GRAY2BGR)
 
 
-def process_one_image(model, img_path, output_dir, min_circularity):
+def process_one_image(model, img_path, output_dir, max_area_frac=0.9, border_margin=2,
+                       background_area_flag_threshold=0.7):
     stem = os.path.splitext(os.path.basename(img_path))[0]
     diagnostics = {
         "image": img_path,
@@ -248,22 +324,29 @@ def process_one_image(model, img_path, output_dir, min_circularity):
         return diagnostics
 
     raw_mask = segment_image(model, img)
-    final_mask = filter_mask_by_circularity(raw_mask, min_circularity)
+    final_mask, selected_contour = select_best_contour(raw_mask, max_area_frac, border_margin)
 
     if np.max(final_mask) == 0:
         diagnostics["fallback_brightness_triggered"] = True
         bright_img = automatic_brightness_and_contrast(img)
         raw_mask = segment_image(model, bright_img)
-        final_mask = filter_mask_by_circularity(raw_mask, min_circularity)
+        final_mask, selected_contour = select_best_contour(raw_mask, max_area_frac, border_margin)
         if np.sum(final_mask) == 0:
             diagnostics["fallback_full_image_triggered"] = True
             final_mask = np.ones_like(final_mask)
+            selected_contour = None
+
+    diagnostics["selected_contour_circularity"] = (
+        round(float(calculate_circularity(selected_contour)), 3) if selected_contour is not None else None
+    )
 
     min_x, min_y, max_x, max_y = find_bounding_box(final_mask)
     h, w = img.shape[0], img.shape[1]
     box_w = max(1, max_x - min_x)
     box_h = max(1, max_y - min_y)
     diagnostics["crop_area_fraction"] = round((box_w * box_h) / float(w * h), 3)
+    diagnostics["possible_background_false_positive"] = bool(
+        diagnostics["crop_area_fraction"] > background_area_flag_threshold)
     diagnostics["touches_border"] = bool(min_x <= 1 or min_y <= 1 or max_x >= w - 1 or max_y >= h - 1)
     diagnostics["bounding_box_xyxy"] = (int(min_x), int(min_y), int(max_x), int(max_y))
 
@@ -325,8 +408,18 @@ def main():
                         help="Directory to write diagnostic outputs to (default: ./segmenter_inspection_output).")
     parser.add_argument("--weights", default=DEFAULT_WEIGHTS,
                         help="Path to the segmenter .pt weights file.")
-    parser.add_argument("--min-circularity", type=float, default=0.7,
-                        help="Circularity threshold, matches the production default of 0.7.")
+    parser.add_argument("--max-area-frac", type=float, default=0.9,
+                        help="Reject a candidate contour as an implausible dish-rim/vignette "
+                             "detection if its area exceeds this fraction of the full frame "
+                             "(default: 0.9). See select_best_contour().")
+    parser.add_argument("--border-margin", type=int, default=2,
+                        help="Pixel margin used to decide whether a candidate contour "
+                             "touches the image border (default: 2). See select_best_contour().")
+    parser.add_argument("--background-area-flag-threshold", type=float, default=0.7,
+                        help="Flag an image's 'possible_background_false_positive' diagnostic "
+                             "if the final crop covers more than this fraction of the frame "
+                             "(default: 0.7) — most likely a faulty detection rather than a "
+                             "genuinely embryo-filling frame.")
     args = parser.parse_args()
 
     image_paths = collect_image_paths(args.images, args.input_dir)
@@ -350,7 +443,10 @@ def main():
             print(f"WARNING: {img_path} does not exist, skipping.")
             continue
         print(f"Processing {img_path} ...")
-        diag = process_one_image(model, img_path, args.output_dir, args.min_circularity)
+        diag = process_one_image(model, img_path, args.output_dir,
+                                  max_area_frac=args.max_area_frac,
+                                  border_margin=args.border_margin,
+                                  background_area_flag_threshold=args.background_area_flag_threshold)
         all_diagnostics.append(diag)
         for k, v in diag.items():
             if k != "image":
@@ -361,13 +457,14 @@ def main():
 
     n = len(all_diagnostics)
     if n:
-        n_bg_flag = sum(1 for d in all_diagnostics if d.get("crop_area_fraction", 0) > 0.85)
+        n_bg_flag = sum(1 for d in all_diagnostics if d.get("possible_background_false_positive"))
         n_border_flag = sum(1 for d in all_diagnostics if d.get("touches_border"))
         n_fallback = sum(1 for d in all_diagnostics if d.get("fallback_brightness_triggered"))
         n_full_fallback = sum(1 for d in all_diagnostics if d.get("fallback_full_image_triggered"))
         n_distorted = sum(1 for d in all_diagnostics if d.get("likely_visible_distortion_in_prod_output"))
         print(f"\nSummary across {n} image(s) (see SEGMENTER_ACCURACY_ROADMAP.md for context):")
-        print(f"  - Possible dish/vignette false-positive (crop area > 85% of frame): {n_bg_flag}")
+        print(f"  - Possible dish/vignette false-positive (crop area > "
+              f"{args.background_area_flag_threshold * 100:.0f}% of frame, likely faulty detection): {n_bg_flag}")
         print(f"  - Bounding box touches image border (possible under-recall or clipped source): {n_border_flag}")
         print(f"  - Brightness-correction fallback triggered: {n_fallback}")
         print(f"  - Full-image fallback triggered (no valid region found at all): {n_full_fallback}")

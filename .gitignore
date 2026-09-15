@@ -1,0 +1,13 @@
+# Virtual environments
+.venv*/
+venv/
+
+# Python bytecode
+__pycache__/
+*.pyc
+
+# OS files
+.DS_Store
+
+# Ad-hoc inspection outputs
+segmenter_inspection_output/
