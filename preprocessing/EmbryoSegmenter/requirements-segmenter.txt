@@ -1,0 +1,9 @@
+# Minimal dependencies to run ONLY the embryo segmenter (SegmenterModel +
+# run_segmenter_inspect.py) — this does NOT include TensorFlow/transformers,
+# which are only needed for the main FEMI foundation model
+# (main_pretrain.py / main_finetune.py). See ../../requirement.txt for the
+# full project dependency list.
+numpy==1.26.4
+pillow==10.4.0
+opencv-python-headless==4.10.0.84
+torch==2.3.0

@@ -148,6 +148,54 @@ accuracy problem. Phase 0 below includes a cheap heuristic to help tell
 these two cases (model under-segmentation vs. genuinely clipped source)
 apart.
 
+### Root cause F — cropping to a non-square box, then force-resizing to a square, distorts the embryo's shape
+
+**Confirmed via `run_segmenter_inspect.py` on real production images** (see
+worked examples below). This is independent of everything above — it
+happens even when the mask/contour logic picks a perfectly reasonable
+region, as long as that region isn't square:
+
+```286:290:preprocessing/preprocessing_images.py
+        min_x, min_y, max_x, max_y = find_bounding_box(final_mask)
+        cropped_image = img[min_y:max_y, min_x:max_x]    
+        cropped_image = Image.fromarray(cropped_image)
+        cropped_image = cropped_image.resize((224, 224))
+        cropped_image.save(cropped_images_dir+image)
+```
+
+`PIL.Image.resize((224, 224))` forces the crop into an exact 224×224
+square **without preserving aspect ratio**. Since `find_bounding_box`
+returns a tight axis-aligned box around the (often irregular) mask, the
+box is very often not square — and whenever it isn't, width and height
+get scaled by *different* factors, visibly warping the embryo's true
+round shape into an oval/stretched form.
+
+**Real examples from a first batch of 7 production images tested with
+`run_segmenter_inspect.py`:**
+
+| Image | Bounding box (w×h) | Aspect ratio | Resize scale (x vs. y) | Result |
+|---|---|---|---|---|
+| `11673354_0331...` | 207×161 | 1.29 | 1.08× vs. 1.39× | Visibly vertically stretched |
+| `24502838_0336...` | 86×147 | 0.585 | 2.61× vs. 1.52× | Visibly horizontally stretched |
+| `23099214_0336...` | 164×136 | 1.21 | — | Borderline distortion |
+| 4 others in the same batch | ratios 0.96–1.11 | — | — | No visible distortion |
+
+**3 of 7 (43%) real sample images** showed a bounding box asymmetric
+enough (>20% off from square) to cause visible distortion. This is a
+**very common, high-impact bug** — likely more visually obvious to a
+human reviewer than any of root causes A–E, since it directly warps the
+embryo's shape (a clinically meaningful feature) rather than just
+mis-placing the crop boundary.
+
+**Important nuance:** fixing this (see Phase 1) by padding the box to a
+square before resizing removes the *stretching*, but if the original box
+is already asymmetric because it's touching the image border (e.g. mask
+under-recall cut off one side), squaring it up will necessarily expand
+into background/dish area on the opposite side rather than recovering
+embryo detail — squarifying the crop and fixing the contour-selection
+logic (root causes A/B) are **complementary fixes, not substitutes** for
+each other.
+
 ### Root cause E — training data coverage/labeling issues
 
 If the original training set for this segmenter under-represents certain
@@ -165,6 +213,7 @@ systematically struggle on those cases regardless of architecture.
 | 1. Hatching/irregular embryo missed | A (irregular contour scores < 0.7, excluded) | Phase 1: replace hard circularity threshold with a softer/largest-component selection |
 | 2. Dish/light circle treated as embryo, minimal cropping | A + B (oversized/border-touching circular contour unioned in) | Phase 1: reject border-touching & oversized contours; pick single best candidate, don't union all |
 | 3. Bottom of embryo missing | C (model under-recall) and/or D (source image already incomplete) | Phase 0 to distinguish which; Phase 1 margin as a band-aid; Phase 2 skip connections for C; data-quality audit/exclusion for D |
+| 4. Final crop looks visibly stretched/warped (embryo shape distorted) | **F (non-square crop force-resized to a square) — confirmed present in production, affects ~43% of a first sample batch** | Phase 1: square up the bounding box (pad to `max(w,h)`, centered, clamped to image bounds) *before* resizing — implemented and validated in `run_segmenter_inspect.py`'s `squarify_bbox()` / `_6_cropped_224_fixed.png` output, ready to port into `preprocessing_images.py` |
 
 ## 3. Evaluating the proposed options
 
@@ -273,6 +322,19 @@ bug (symptom 2) on its own, and can't fix genuinely clipped source images
 
 Roughly ordered from cheapest/fastest to most involved:
 
+0. **Fix the shape-distortion bug (root cause F) — near-zero engineering
+   cost, no retraining required, arguably the single highest-visual-impact
+   fix available.** Square up the bounding box before cropping/resizing:
+   expand the shorter side to match the longer side, centered on the
+   original box, clamped to stay within the image, *then* crop and resize
+   to 224×224 (now a uniform, non-distorting scale). This is already
+   implemented and validated against real production images in
+   `run_segmenter_inspect.py` (`squarify_bbox()`, `_6_cropped_224_fixed.png`
+   output) — porting the same ~15 lines into `preprocessing_images.py`'s
+   `process_image()` is a small, low-risk change. Note this doesn't
+   replace fix #1 below (rejecting bad contours) — an asymmetric,
+   border-touching box will still pull in extra background once
+   squared, rather than recovering missing embryo detail; do both.
 1. **Fix the contour-selection logic (root causes A + B) — near-zero
    engineering cost, no retraining required, should be tried first:**
    - Instead of unioning *every* contour that clears the circularity
@@ -342,7 +404,7 @@ Roughly ordered from cheapest/fastest to most involved:
 | Phase | Effort | What | Why first/next |
 |---|---|---|---|
 | **0. Diagnose** | Hours | Instrument `process_image` to log/save, per image: (a) fraction of frame area covered by the final crop (flags symptom 2 — dish/vignette — when it's e.g. >85%); (b) whether the final box touches any image border (flags symptom 3 candidates — either model under-recall or a genuinely clipped source frame); (c) how often the brightness-retry fallback triggers, and how often the full-image fallback (`np.ones_like`) triggers; (d) a random sample of mask visualizations overlaid on the original image for manual review, stratified across the three symptom categories. | You need to know the actual prevalence of each root cause (A–E) before investing in retraining — e.g. the >85%-area-covered metric directly measures how common the union-of-contours bug (symptom 2) is. This costs almost nothing and de-risks every subsequent phase. |
-| **1. Quick wins** | Days | Replace "union of all circularity-passing contours" with "single best candidate" scored by circularity + plausible size range + centrality; reject border-touching/oversized contours outright (fixes symptom 2 and helps symptom 1); apply morphological closing before contour-finding (helps symptom 1); add a bounding-box safety margin (helps symptom 3's model-recall component). Re-run Phase 0's diagnostics to measure improvement on each symptom category separately. | Zero retraining required; directly fixes the most likely and cheapest-to-fix root causes (A/B — the post-processing logic, not the model). Should be done regardless of which long-term path you choose, and should meaningfully reduce symptoms 1 and 2 immediately. |
+| **1. Quick wins** | Days | **(a)** Square up the bounding box before cropping/resizing (root cause F — fixes symptom 4, already prototyped in `run_segmenter_inspect.py`); **(b)** replace "union of all circularity-passing contours" with "single best candidate" scored by circularity + plausible size range + centrality; reject border-touching/oversized contours outright (fixes symptom 2 and helps symptom 1); **(c)** apply morphological closing before contour-finding (helps symptom 1); **(d)** add a bounding-box safety margin (helps symptom 3's model-recall component). Re-run Phase 0's diagnostics to measure improvement on each symptom category separately. | Zero retraining required; directly fixes the most likely and cheapest-to-fix root causes (A/B/F — all post-processing logic, not the model). Should be done regardless of which long-term path you choose, and (a) in particular has an immediately visible, easy-to-demo impact. |
 | **2. Architecture + data pipeline** | 1–3 weeks | Build the (currently-missing) training pipeline for this component. Decide between (a) adding skip connections to the existing CNN and continuing to train it on mask data, or (b) converting existing masks to boxes and training a lightweight detector (YOLO-nano class or a simple custom box-regression head) instead — informed by Phase 0's findings. Either way, reuse existing labeled masks; no new labels needed yet. | This is where the YOLO-vs-more-data decision actually gets made, backed by evidence from Phase 0 rather than guesswork. |
 | **3. Targeted data expansion** | Ongoing | Use Phase 0's hard-example flags (plus any new failures found after Phase 1/2) to drive **targeted** new data collection/labeling — ideally as cheap bounding boxes rather than full masks (per §1), explicitly including "hard negative" frames with a visible dish rim/vignette so the model learns to ignore them, optionally accelerated by a prompted foundation model (SAM) to speed up annotation. Separately, audit and flag/exclude source images where the embryo appears genuinely clipped at acquisition time (root cause D) — this is a data-quality fix, not a model-training fix. Retrain periodically as new hard examples accumulate. | Highest long-term payoff, but should be targeted at known failure modes rather than done blindly, and is naturally an ongoing process rather than a one-time fix. |
 | **4. Re-validate efficiency** | Days | Once a new model is chosen, re-run the efficiency analysis from `SEGMENTER_PERFORMANCE_ANALYSIS.md` (GPU batching, thread settings, etc.) against the new model to confirm the constant-factor recommendations still apply. | Efficiency work is largely orthogonal to the model architecture (per that doc) — worth confirming rather than assuming after a model swap. |
