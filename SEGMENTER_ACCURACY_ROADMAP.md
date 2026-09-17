@@ -5,7 +5,54 @@
 [`SEGMENTER_PERFORMANCE_ANALYSIS.md`](SEGMENTER_PERFORMANCE_ANALYSIS.md)
 for the efficiency/complexity analysis this roadmap builds on.
 
-**Reported problems** (three distinct symptom categories observed in
+## Status (as of September 2026)
+
+Work so far lives in **`preprocessing/run_segmenter_inspect.py`** — a
+standalone inspection CLI for manually testing the segmenter on a handful
+of images. **`preprocessing/preprocessing_images.py` (production batch
+preprocessing) still uses the original circularity-union logic** until the
+Phase 1 fixes below are ported over.
+
+| Item | Status | Where |
+|---|---|---|
+| Phase 0 diagnostics (crop fraction, border touch, fallback flags, mask/bbox overlays) | **Done** | `run_segmenter_inspect.py` |
+| Phase 1(a): square-up crop before resize (`squarify_bbox`) | **Done (inspect tool only)** | `_6_cropped_224_fixed.png` output |
+| Phase 1(b): single best-contour selection (no circularity, no union) | **Done (inspect tool only)** | `select_best_contour()` |
+| Phase 1(b): reject border-touching / oversized contours | **Done (inspect tool only)** | `select_best_contour()` defaults: `border_margin=2`, `max_area_frac=0.9` |
+| Phase 1: `possible_background_false_positive` flag (crop area > 70%) | **Done (inspect tool only)** | `--background-area-flag-threshold` (default 0.7) |
+| Phase 1(c): morphological closing before contour-finding | **Not yet** | — |
+| Phase 1(d): bounding-box safety margin | **Not yet** | — |
+| Port Phase 1 fixes into `preprocessing_images.py` | **Not yet** | Next step for production |
+| Cross-check against the published methodology (Rajendran et al. 2025) | **Done** | §3 below |
+| Segmenter training/fine-tuning pipeline | **Done** | `train_segmenter.py` (didn't exist before — see §4 Option B) |
+| Labeled dataset: original 30-pair paper dataset recovered + 10 new labeled pairs | **Done** | `mask/` + `mask_valid/` (23 train / 5 val) + `new_labels/` (10 pairs) — 38 total |
+
+### Validated on 7 problematic production images (`problematic_raw_images/`)
+
+Compared against the **old** production-style logic (circularity ≥ 0.7,
+union of all passing contours) on the same weights and images:
+
+| Metric | Old logic | New logic (`select_best_contour`) |
+|---|---|---|
+| Full-image fallback (`np.ones_like`) | 1 / 7 | **0 / 7** |
+| Brightness-correction fallback | 1 / 7 | **0 / 7** |
+| Possible dish/vignette false-positive (crop > 70%) | 1 / 7 | **0 / 7** |
+| Bounding box touches border | 4 / 7 | 4 / 7 *(unchanged — model/source issue)* |
+| Likely visible aspect-ratio distortion in `_5` crop | 3 / 7 | 4 / 7 *(unchanged until squarify is used for final output)* |
+
+**Standout fix:** `22987821_0331_110.5_SB_0.jpg` previously hit the
+worst-case full-image fallback (crop area 99.1%, essentially no cropping).
+The new logic finds the actual embryo on the first pass (crop area 34.6%).
+
+**Still open:** 4 images still have border-touching boxes and/or visible
+stretching in the production-faithful `_5` output — these point to root
+causes C/D (model under-recall or genuinely clipped source), not the
+contour-selection bug. Use `_4_bbox_overlay.png` (red = final box, green =
+squarified box) and `_6_cropped_224_fixed.png` to review.
+
+---
+
+**Reported problems** (four distinct symptom categories observed in
 production):
 1. **Hatching / irregularly-shaped embryos** get cropped incorrectly (part
    of the embryo missed).
@@ -16,6 +63,9 @@ production):
    portion — sometimes because the *source* image itself never fully
    captured the embryo (an acquisition-time issue, not a preprocessing
    bug).
+4. **The final cropped output looks visibly stretched/warped** — the
+   embryo's round shape is distorted because a non-square bounding box is
+   force-resized to 224×224 without preserving aspect ratio (root cause F).
 
 This document lays out (1) a key architectural fact that reframes the
 problem, (2) a diagnosis mapping each of these three symptoms to specific,
@@ -73,6 +123,12 @@ a few lines of post-processing code.
 
 ### Root cause A — the circularity filter takes the UNION of every passing contour, not the single best one
 
+**Note:** this is not merely a hypothesized bug — §3 confirms the
+published methodology itself calls for picking **the single most
+circular contour**, so this "union of all passing contours" behavior is
+a deviation from the paper's own described design, not a defensible
+alternative design choice.
+
 This is the code in question:
 
 ```257:262:preprocessing/preprocessing_images.py
@@ -125,12 +181,23 @@ Even before contour filtering, the network may under-predict the embryo's
 true extent (contributes most directly to **Symptom 3**, bottom-of-embryo
 missing). Plausible contributing factors given the architecture (see
 `SegmenterModel.py`):
-- **No skip connections** between encoder and decoder (unlike a classic
-  U-Net) — all boundary detail must be reconstructed from a 7×7×512
-  bottleneck, which is known to hurt fine boundary precision and can cause
-  systematic under-prediction at edges (plausibly worse at the
-  bottom/edges of frame if there's any positional bias in lighting or
-  training data).
+- **No skip connections** between encoder and decoder, despite the paper
+  calling this component a "U-Net" (see §3, item #1 — and note it's also
+  not a real Inception-module network) — all boundary detail must be
+  reconstructed from a 7×7×512 bottleneck, which is known to hurt fine
+  boundary precision and can cause systematic under-prediction at edges
+  (plausibly worse at the bottom/edges of frame if there's any positional
+  bias in lighting or training data). Adding skip connections to the
+  *existing* lightweight architecture is measured at **+28% CPU inference
+  time (+9 ms/image), +12.5% parameters** (see
+  [`SEGMENTER_PERFORMANCE_ANALYSIS.md`](SEGMENTER_PERFORMANCE_ANALYSIS.md)
+  §3.1) — cheap, and most of the current production checkpoint's weights
+  can be reused (only 4 of 12 layers change shape). A full real-Inception
+  backbone (optionally ImageNet-pretrained) would cost far more compute
+  (~24M params / ~5.7 GFLOPs vs. ~3.1M / ~1.2 GFLOPs) and, more
+  importantly, carries real overfitting risk given the ~38 labeled
+  examples currently available (see §4 Option C item 3 for the full
+  comparison) — start with skip connections alone.
 - Fixed 0.5 sigmoid threshold may cut off legitimately-embryo but
   lower-confidence pixels, which are more likely to occur at the
   periphery of the embryo (e.g. a fainter lower boundary due to lighting
@@ -210,12 +277,75 @@ systematically struggle on those cases regardless of architecture.
 
 | Symptom | Most likely root cause(s) | Fastest fix |
 |---|---|---|
-| 1. Hatching/irregular embryo missed | A (irregular contour scores < 0.7, excluded) | Phase 1: replace hard circularity threshold with a softer/largest-component selection |
-| 2. Dish/light circle treated as embryo, minimal cropping | A + B (oversized/border-touching circular contour unioned in) | Phase 1: reject border-touching & oversized contours; pick single best candidate, don't union all |
+| 1. Hatching/irregular embryo missed | A (irregular contour scores < 0.7, excluded) | **Done in inspect tool:** drop circularity entirely; pick single largest plausible contour (see `select_best_contour()`). Still pending: morphological closing, bbox margin |
+| 2. Dish/light circle treated as embryo, minimal cropping | A + B (oversized/border-touching circular contour unioned in) | **Done in inspect tool:** reject border-touching/oversized contours; pick single best candidate; flag crop > 70% as `possible_background_false_positive` |
 | 3. Bottom of embryo missing | C (model under-recall) and/or D (source image already incomplete) | Phase 0 to distinguish which; Phase 1 margin as a band-aid; Phase 2 skip connections for C; data-quality audit/exclusion for D |
-| 4. Final crop looks visibly stretched/warped (embryo shape distorted) | **F (non-square crop force-resized to a square) — confirmed present in production, affects ~43% of a first sample batch** | Phase 1: square up the bounding box (pad to `max(w,h)`, centered, clamped to image bounds) *before* resizing — implemented and validated in `run_segmenter_inspect.py`'s `squarify_bbox()` / `_6_cropped_224_fixed.png` output, ready to port into `preprocessing_images.py` |
+| 4. Final crop looks visibly stretched/warped (embryo shape distorted) | **F (non-square crop force-resized to a square) — confirmed present in production, affects ~43% of a first sample batch** | **Done in inspect tool:** `squarify_bbox()` + `_6_cropped_224_fixed.png`. **Not yet in production** — `_5` output still mirrors the old non-preserving resize until ported |
 
-## 3. Evaluating the proposed options
+## 3. Cross-checking against the published methodology (Rajendran et al. 2025)
+
+This repo is the code release for ["A foundational model for in vitro
+fertilization trained on 18 million time-lapse images"](https://www.nature.com/articles/s41467-025-61116-2)
+(Rajendran et al., *Nature Communications* 16:6235, 2025). The paper's
+Methods section ("Datasets and preprocessing") describes the original
+embryo segmenter as follows:
+
+> "An InceptionV3 U-Net was trained using 30 image-mask pairs of
+> whole-embryo segmentations. 80% of the dataset was used for training
+> the model, with the rest being used for validation. To make the model
+> more robust, we added data augmentations to the training data,
+> including random cropping, flipping, rotation, and translation... Before
+> generating segmentation masks, each image undergoes an automatic
+> brightness and contrast adjustment to standardize lighting conditions...
+> After generating a segmentation mask for each input image, circular
+> contours were detected in the image using OpenCV. A bounding box is
+> drawn around **the most circular contour**, which is likely the embryo.
+> The image is then cropped around the bounding box and resized to
+> 224×224 for input into FEMI."
+
+This section checks the current code — both `preprocessing_images.py`
+(production, unmodified by the Phase 1 work above) and
+`run_segmenter_inspect.py` (the Phase 1 prototype) — against that
+description, and is careful to distinguish gaps that **predate** Phase 1
+from ones **introduced by** it.
+
+| # | Paper says | Production `preprocessing_images.py` | `run_segmenter_inspect.py` | Caused by Phase 1 work? |
+|---|---|---|---|---|
+| 1 | "InceptionV3 **U-Net**" | `SegmenterModel.py` is **neither**: no skip connections (the "U-Net" part), and no real Inception modules either — see note below | Same model file, identical | **No** — pre-existing, inherited from the original repo, unrelated to any fix here |
+| 2 | Brightness/contrast correction applied to **every image, unconditionally**, before mask generation | Applied only as a **fallback**, triggered only if the first pass finds nothing (lines 265-269) | Identical fallback-only behavior (lines 329-331) — copied as-is | **No** — pre-existing, and deliberately preserved rather than changed |
+| 3 | Bounding box drawn around **the single most circular contour** | Unions **every** contour above a 0.7 circularity threshold (lines 258-262) — already a deviation from the paper's own design before Phase 1 touched anything | `select_best_contour()`: single contour, but scored by border/size/centrality, **not circularity** (per explicit direction to drop it — see root cause A) | **Partially** — Phase 1 fixed the "union" bug (bringing it structurally closer to the paper: one contour, not many) but chose a different selection criterion than "most circular" |
+| 4 | "Cropped around the bounding box and resized to 224×224" (aspect-ratio handling not stated either way) | Forces a square resize without preserving aspect ratio (line 289) | `_5` output: byte-identical to production on purpose. `_6` is an *added* alternative | **No conflict confirmed** — the paper doesn't state whether aspect ratio should be preserved, so root cause F is an independently-identified implementation issue, not a documented paper deviation. The `_6` fix is additive only, `_5` stays faithful |
+| 5 | "Input images are then normalized using ImageNet mean and standard deviation parameters" | N/A to the segmenter itself | N/A to the segmenter itself | **Not a conflict** — this describes normalizing FEMI's (ViT MAE) input *after* the segmenter's crop, not the segmenter's own input. The segmenter's own input normalization (divide by 255, in both files) is a separate, earlier step the paper doesn't contradict |
+| 6 | Segmenter trained on 30 pairs, 80/20 split, augmented with random cropping/flipping/rotation/translation | N/A (training script doesn't exist in this repo/this analysis is inference-only) | N/A | **Informs, doesn't conflict** — `preprocessing/train_segmenter.py` (built separately for fine-tuning with new labeled data) defaults `--val-frac` to 0.2 and its augmentation set (random crop + flip + 90°-rotation) to approximate this description, since no training script previously existed to compare against |
+
+**Item #1 in detail — "InceptionV3" is a misnomer, not just "missing skip
+connections":** `SegmenterModel.py`'s `BasicConv2d`/`BasicConv2dSigmoid`
+helper blocks are a near-verbatim copy of `torchvision`'s `BasicConv2d`
+helper from its real InceptionV3 implementation (the file even says so:
+`# A copy of Inception V3 allowing a dynamic number of input channels`,
+directly above the model class). That's *all* that was borrowed. What's
+missing relative to real InceptionV3: multi-branch **Inception modules**
+(parallel 1×1/3×3/5×5/pooling branches concatenated together — this model
+has a single conv path per stage instead), factorized convolutions, and
+ImageNet-pretrained weights. Real InceptionV3 is ~24M parameters / ~5.7
+GFLOPs (299×299 input); this model is ~3.1M parameters / ~1.2 GFLOPs — an
+~8×/~5× difference. See §4 Option C item 3 for what it would cost to close
+each of these two gaps (skip connections vs. a real Inception backbone)
+separately, since they have very different cost/risk profiles.
+
+**Net takeaway:** of the six points checked, only **one (#3)** involves
+something the Phase 1 work in this repo actually changed — and even
+there, production's pre-Phase-1 behavior (union of all circular contours)
+was *already* a deviation from the paper's own stated design before any
+of this session's fixes existed. The architecture gap (#1) and the
+brightness/contrast timing gap (#2) are untouched, pre-existing gaps
+between this repo and the published methodology, inherited as-is by
+`run_segmenter_inspect.py` for behavioral fidelity. Root cause F (#4) and
+the training-pipeline defaults (#6) aren't paper deviations at all — the
+paper is either silent or the new script's defaults were chosen to align
+with it.
+
+## 4. Evaluating the proposed options
 
 ### Option A: Replace the CNN with YOLO
 
@@ -251,11 +381,11 @@ O(1) per image / O(N) overall, per the companion performance doc) — this
 is purely a constant-factor comparison, and it looks favorable.
 
 **Costs / risks:**
-- **No training pipeline exists in this repo today** for the segmenter at
-  all (only the model definition + inference script). Adopting YOLO does
-  not avoid this — you'd need to build a training pipeline either way
-  (see §4), likely using the `ultralytics` package for YOLO specifically,
-  which is a new dependency.
+- **No YOLO-specific training pipeline exists.** `train_segmenter.py`
+  (added since this section was first written — see Option B) trains the
+  current mask-based CNN, not a detector; adopting YOLO would still mean
+  building a separate training pipeline, likely using the `ultralytics`
+  package, a new dependency.
 - Bounding-box labels are needed, but as noted in §1, these can be
   **derived for free** from any existing pixel-mask training data used for
   the current model — no new manual annotation required to get started.
@@ -287,9 +417,13 @@ light vignettes) directly addresses root cause E and can partially
 compensate for root cause C (architecture limitations).
 
 **Cons / caveats:**
-- **This repo has no existing segmenter training script or dataset** — one
-  would need to be built from scratch regardless (dataset loader, loss
-  function [e.g. Dice/BCE], train/val loop, checkpointing).
+- The training pipeline and original dataset gap has been closed:
+  `train_segmenter.py` now exists (dataset loader, Dice/BCE loss, train/val
+  loop, checkpointing, fine-tuning from the production checkpoint), and
+  the original ~30-pair paper dataset plus 10 newly labeled pairs are
+  available (38 total — see Status table). The remaining cost is
+  **labeling more, targeted data**, not building infrastructure from
+  scratch.
 - It does **not** fix root causes A/B (the union-of-all-contours and
   missing size/border sanity checks) at all — those are deterministic
   post-processing bugs that exist independent of model quality. More data
@@ -337,17 +471,23 @@ Roughly ordered from cheapest/fastest to most involved:
    squared, rather than recovering missing embryo detail; do both.
 1. **Fix the contour-selection logic (root causes A + B) — near-zero
    engineering cost, no retraining required, should be tried first:**
-   - Instead of unioning *every* contour that clears the circularity
-     threshold, score each candidate and **keep only the single best
-     one** — e.g. rank by a combination of circularity, area (within a
-     plausible expected-embryo-size range for a 224×224 frame, tunable
-     from a sample of good crops), and distance of the contour's centroid
-     from the image center (embryos are typically framed near-center).
+   **Partially implemented in `run_segmenter_inspect.py` (`select_best_contour()`).**
+   - Instead of unioning *every* contour that clears a circularity
+     threshold, **keep only the single best candidate**. The implemented
+     version **does not use circularity at all** (reported only as a
+     diagnostic) — it ranks by area (largest wins) with a tie-break toward
+     the frame center, after preferring contours that pass border/size
+     sanity checks. Circularity was dropped deliberately: hatching and
+     multi-cell embryos are often non-circular, while dish rims are
+     border-touching and oversized regardless of shape.
    - **Explicitly reject contours that touch or nearly touch the image
-     border**, and/or whose area exceeds some fraction (e.g. 80–90%) of
+     border**, and/or whose area exceeds some fraction (default 90%) of
      the full frame — a dish rim or light vignette will almost always
      trip one of these checks, while a real (even off-center) embryo
-     usually won't.
+     usually won't. If no contour passes, fall back to the full candidate
+     pool (so a genuinely edge-framed embryo is not vetoed outright).
+   - Flag final crops covering > 70% of the frame as
+     `possible_background_false_positive` (implemented).
    - Apply morphological closing (`cv2.morphologyEx` with `MORPH_CLOSE`)
      to merge small mask fragments before contour-finding, which helps
      with irregular/hatching shapes (symptom 1) without needing a shape
@@ -365,11 +505,20 @@ Roughly ordered from cheapest/fastest to most involved:
    of both attempts' contours (rather than either/or) could recover
    embryo area that's only visible in one of the two versions.
 3. **Add skip connections to `SegmenterModel`** (turn it into a real
-   U-Net). Cheap in compute (still well under 1 GFLOP total) and directly
-   targets root cause C's boundary-precision limitation, without
-   needing a new training pipeline built around a different framework
-   (still plain PyTorch). This requires retraining with the existing data
-   format, so it's a good complement to Option B.
+   U-Net, keeping its current lightweight conv blocks). Measured cost:
+   **+28% CPU inference time (+9 ms/image), +12.5% parameters** (see
+   performance doc §3.1) — directly targets root cause C's
+   boundary-precision limitation, needs no new framework (still plain
+   PyTorch, plugs into `train_segmenter.py` as-is), and most of the
+   current checkpoint's weights transfer directly (only 4 of 12 layers
+   change shape). **Recommended as the first architecture change to try.**
+   A further, separate option — replacing the encoder with a *real*
+   Inception-module backbone (optionally ImageNet-pretrained), matching
+   what the paper's "InceptionV3" name implies (see §3, item #1) — would
+   cost far more (~24M params / ~5.7 GFLOPs vs. ~3.1M / ~1.2 GFLOPs, an
+   ~8×/~5× jump) and risks overfitting given the ~38 labeled examples
+   currently available; only worth it with substantially more data or
+   heavy layer-freezing.
 4. **Use a pretrained/foundation segmentation model** (e.g. Meta's
    Segment Anything Model, SAM/SAM2) prompted with a rough
    center-point/box, either as the production model (if latency budget
@@ -399,17 +548,18 @@ Roughly ordered from cheapest/fastest to most involved:
    would need the same border/size sanity checks as #1, or it will be
    just as prone to "detecting" the dish rim as a circle.
 
-## 4. Recommended Phased Roadmap
+## 5. Recommended Phased Roadmap
 
 | Phase | Effort | What | Why first/next |
 |---|---|---|---|
-| **0. Diagnose** | Hours | Instrument `process_image` to log/save, per image: (a) fraction of frame area covered by the final crop (flags symptom 2 — dish/vignette — when it's e.g. >85%); (b) whether the final box touches any image border (flags symptom 3 candidates — either model under-recall or a genuinely clipped source frame); (c) how often the brightness-retry fallback triggers, and how often the full-image fallback (`np.ones_like`) triggers; (d) a random sample of mask visualizations overlaid on the original image for manual review, stratified across the three symptom categories. | You need to know the actual prevalence of each root cause (A–E) before investing in retraining — e.g. the >85%-area-covered metric directly measures how common the union-of-contours bug (symptom 2) is. This costs almost nothing and de-risks every subsequent phase. |
-| **1. Quick wins** | Days | **(a)** Square up the bounding box before cropping/resizing (root cause F — fixes symptom 4, already prototyped in `run_segmenter_inspect.py`); **(b)** replace "union of all circularity-passing contours" with "single best candidate" scored by circularity + plausible size range + centrality; reject border-touching/oversized contours outright (fixes symptom 2 and helps symptom 1); **(c)** apply morphological closing before contour-finding (helps symptom 1); **(d)** add a bounding-box safety margin (helps symptom 3's model-recall component). Re-run Phase 0's diagnostics to measure improvement on each symptom category separately. | Zero retraining required; directly fixes the most likely and cheapest-to-fix root causes (A/B/F — all post-processing logic, not the model). Should be done regardless of which long-term path you choose, and (a) in particular has an immediately visible, easy-to-demo impact. |
-| **2. Architecture + data pipeline** | 1–3 weeks | Build the (currently-missing) training pipeline for this component. Decide between (a) adding skip connections to the existing CNN and continuing to train it on mask data, or (b) converting existing masks to boxes and training a lightweight detector (YOLO-nano class or a simple custom box-regression head) instead — informed by Phase 0's findings. Either way, reuse existing labeled masks; no new labels needed yet. | This is where the YOLO-vs-more-data decision actually gets made, backed by evidence from Phase 0 rather than guesswork. |
+| **0. Diagnose** | Hours | Instrument `process_image` to log/save, per image: (a) fraction of frame area covered by the final crop; (b) whether the final box touches any image border; (c) how often the brightness-retry and full-image fallbacks trigger; (d) mask/bbox visualizations for manual review. | **Largely done** in `run_segmenter_inspect.py` (6 diagnostic PNGs per image + console metrics). Still worth porting the same logging into `preprocessing_images.py` for batch runs. |
+| **1. Quick wins** | Days | **(a)** Square up the bounding box before cropping/resizing (root cause F). **(b)** Replace circularity-union with single best-contour selection (no circularity; border/size rejection + area/centrality scoring). **(c)** Morphological closing. **(d)** Bounding-box safety margin. | **(a) and (b) done in inspect tool**, validated on 7 problematic images (see Status table above). **(c) and (d) not yet.** Next: port (a)+(b) into `preprocessing_images.py`, then re-run diagnostics at scale. Zero retraining required. |
+| **2. Architecture** | Days–1 week | `train_segmenter.py` and the labeled dataset already exist (see Status table), so this is mainly a model-code change: add skip connections to `SegmenterModel` (+28% inference cost, +12.5% params — see performance doc §3.1) and fine-tune, reusing most of the current checkpoint. | Cheapest architecture fix for root cause C; directly addresses the paper's "U-Net" gap. |
+| **2b. Bigger architecture bet (optional, defer)** | 1–3 weeks | Either (a) a real Inception-module backbone (optionally ImageNet-pretrained — a much bigger jump, ~8×/~5× more params/FLOPs, needs careful freezing given current data scale), or (b) converting existing masks to boxes and training a lightweight detector (YOLO-nano class) instead — informed by Phase 2's results and Phase 0's diagnostics. | Only pursue once Phase 2's cheaper fix has been tried and/or the labeled dataset has grown meaningfully. |
 | **3. Targeted data expansion** | Ongoing | Use Phase 0's hard-example flags (plus any new failures found after Phase 1/2) to drive **targeted** new data collection/labeling — ideally as cheap bounding boxes rather than full masks (per §1), explicitly including "hard negative" frames with a visible dish rim/vignette so the model learns to ignore them, optionally accelerated by a prompted foundation model (SAM) to speed up annotation. Separately, audit and flag/exclude source images where the embryo appears genuinely clipped at acquisition time (root cause D) — this is a data-quality fix, not a model-training fix. Retrain periodically as new hard examples accumulate. | Highest long-term payoff, but should be targeted at known failure modes rather than done blindly, and is naturally an ongoing process rather than a one-time fix. |
 | **4. Re-validate efficiency** | Days | Once a new model is chosen, re-run the efficiency analysis from `SEGMENTER_PERFORMANCE_ANALYSIS.md` (GPU batching, thread settings, etc.) against the new model to confirm the constant-factor recommendations still apply. | Efficiency work is largely orthogonal to the model architecture (per that doc) — worth confirming rather than assuming after a model swap. |
 
-## 5. Direct Answers to the Questions Asked
+## 6. Direct Answers to the Questions Asked
 
 - **"If I replace the CNN with a YOLO model, will it successfully increase
   accuracy and still be efficient?"** — Efficiency: very likely yes, a
@@ -422,9 +572,10 @@ Roughly ordered from cheapest/fastest to most involved:
   reproduce root causes A/B. It is **not guaranteed** to fix symptom 3 on
   its own, since that depends on model recall (root cause C, fixable with
   better architecture/data) and/or genuinely incomplete source images
-  (root cause D, not fixable by *any* model). Also note there's currently
-  **no training pipeline for this component at all**, so adopting YOLO
-  requires building one regardless.
+  (root cause D, not fixable by *any* model). Note a training pipeline
+  now exists (`train_segmenter.py`) but it's for the current mask-based
+  CNN, not a detector — adopting YOLO still means building a separate
+  pipeline.
 - **"Or should we just train on more data with correct labeling?"** — Yes,
   this should happen eventually under any architecture, but **not as the
   first step**, and not as *undirected* bulk collection — target it at the
@@ -440,10 +591,11 @@ Roughly ordered from cheapest/fastest to most involved:
 - **"Are there other approaches you suggest?"** — Yes: before touching the
   model at all, fix the contour-selection logic (Phase 1 — reject
   border-touching/oversized contours, pick a single best candidate instead
-  of unioning all passers, add a bounding-box margin) — this is nearly
-  free, requires no retraining, and should meaningfully reduce symptoms 1
-  and 2 by itself. Beyond that, adding skip connections (U-Net-style),
+  of unioning all passers, square up the crop, add a bounding-box margin).
+  The first two items are **already prototyped and validated** in
+  `run_segmenter_inspect.py`; porting them to production is the immediate
+  next step. Beyond that, adding skip connections (U-Net-style),
   leveraging a pretrained foundation segmentation model (SAM) to
   accelerate labeling, temporal smoothing across video frames, and
   active-learning-driven data collection targeting all three symptom
-  categories are all worth considering, as detailed in §3.
+  categories are all worth considering, as detailed in §4.

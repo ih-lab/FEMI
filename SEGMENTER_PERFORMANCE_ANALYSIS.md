@@ -22,6 +22,16 @@ multiprocessing-portability bug, and duplicated logic) that are cheap to
 fix and could yield large **constant-factor** (real wall-clock) speedups,
 plus a couple of low-risk accuracy improvements worth considering.
 
+**Update (September 2026):** Phase 1 accuracy fixes have been prototyped
+in `preprocessing/run_segmenter_inspect.py` (see
+[`SEGMENTER_ACCURACY_ROADMAP.md`](SEGMENTER_ACCURACY_ROADMAP.md) Status
+section). §6 below compares the **old** production post-processing
+(circularity filter + union of all passing contours) against the **new**
+logic (`select_best_contour` + optional `squarify_bbox`). The CNN forward
+pass is unchanged there; §3.1 separately quantifies the cost of a
+*different*, not-yet-implemented change — adding skip connections to
+`SegmenterModel` itself.
+
 ## 1. Pipeline Overview
 
 For each of the N input images, `process_image()` in
@@ -30,9 +40,11 @@ For each of the N input images, `process_image()` in
 1. `load_image` — decode the image file and resize to a fixed 224x224.
 2. `segment_image` — one forward pass through `SegmenterModel` (a small
    PyTorch CNN) producing a 224x224 mask; threshold at 0.5.
-3. `cv2.findContours` + `calculate_circularity` — find contours in the
-   mask and keep only those that look sufficiently circular (embryos are
-   roughly round).
+3. `cv2.findContours` + contour filtering — in **production**
+   (`preprocessing_images.py`): keep every contour whose circularity
+   exceeds 0.7 and union them all; in the **prototyped fix**
+   (`run_segmenter_inspect.py`): pick a single best candidate by
+   border/size sanity checks + area/centrality (no circularity filter).
 4. **Fallback path (only triggered if step 3 finds nothing):** re-run
    steps 2–3 on a brightness/contrast-corrected copy of the image. If that
    also finds nothing, skip cropping entirely (use the full frame).
@@ -55,7 +67,8 @@ Every step in `process_image()` operates on data whose size is **fixed**
 | CNN forward pass (`segment_image`) | No | O(1) — fixed-size network, see §3 |
 | Mask threshold | No | O(1) (224×224 = 50,176 fixed elements) |
 | `cv2.findContours` | No | O(1) (bounded by 224×224 mask) |
-| `calculate_circularity` per contour | No | O(1) (perimeter ≤ O(224+224)) |
+| Contour filtering (circularity-union *or* best-candidate selection) | No | O(1) (bounded by mask size; see §6) |
+| `squarify_bbox` (new, optional) | No | O(1) |
 | Bounding box / crop / resize / save | No | O(1) |
 
 So the per-image cost is **O(P)** where P is the original image's pixel
@@ -109,21 +122,41 @@ doubling channel count at each step — a nicely balanced design. ~1.2
 GFLOPs per image is a **very small** model by modern standards (for
 reference, ResNet-50 is ~4 GFLOPs and MobileNetV2 is ~0.3 GFLOPs), so the
 constant C is inherently small — the architecture itself is not the
-bottleneck. On a modern CPU with optimized BLAS/MKL-DNN kernels (which
-PyTorch uses by default), this should take on the order of single-digit
-to tens of milliseconds per image; on a GPU, well under a millisecond when
-batched.
+bottleneck.
 
-*(Note: no GPU/PyTorch benchmarking environment was available while
-writing this analysis — the sandbox used has 1 CPU core and no PyTorch
-installed — so the above is an analytical FLOP-based estimate rather than
-a measured benchmark. We recommend running a quick timing test on your
-actual hardware, e.g. `python -c "import time, torch; from
-EmbryoSegmenter.SegmenterModel import SegmenterModel; m =
-SegmenterModel().eval(); x = torch.rand(1,1,224,224); [m(x) for _ in
-range(3)]; t=time.time(); [m(x) for _ in range(100)];
-print((time.time()-t)/100)"` to get a real per-image latency number on
-your machine.)*
+**Measured** in `preprocessing/.venv-segmenter` (CPU, single-threaded,
+batch=1, 100-iteration average after warmup): **32.8 ms/image**, matching
+the FLOP estimate well. On a GPU with batching, this drops to well under a
+millisecond per image (not directly measured here — no GPU was available
+in this environment — but batched GPU inference for a model this size is
+routine).
+
+### 3.1 Cost of adding skip connections (U-Net-style)
+
+The paper describes this component as an "InceptionV3 **U-Net**", but
+`SegmenterModel` has no skip connections between encoder and decoder (see
+[`SEGMENTER_ACCURACY_ROADMAP.md`](SEGMENTER_ACCURACY_ROADMAP.md) §3 and
+Root cause C for why this plausibly hurts mask boundary accuracy). This
+section quantifies the cost of *just* adding skip connections to the
+existing lightweight architecture (concatenating each encoder stage's
+pre-pool feature map into the matching decoder stage) — not the larger,
+separate question of using a real Inception-module backbone (see the
+roadmap for that comparison, which is much more expensive).
+
+Measured by implementing this variant and benchmarking both side by side
+(same environment as above):
+
+| | Current (no skip) | + Skip connections | Change |
+|---|---|---|---|
+| MACs | ~592M (~1.2 GFLOPs) | ~831M (~1.7 GFLOPs) | +40% (analytical) |
+| Parameters | 3,145,954 | 3,537,778 | +12.5% (measured) |
+| CPU forward pass (1 thread, batch=1) | 32.8 ms | 41.9 ms | **+28%** (measured) |
+
+This is a real but small cost in absolute terms (+9 ms/image on CPU,
+negligible once GPU-batched per §5). Only 4 of the 6 decoder layers change
+shape (`deconv4`/`3`/`2`/`1` and `decoded`) — the encoder and `deconv5`
+are untouched, so a checkpoint fine-tuned this way can reuse most of the
+current production weights rather than retraining from scratch.
 
 ## 4. Where Real-World Time Is Likely Actually Going
 
@@ -168,12 +201,15 @@ algorithmic ones:
    easily be forgotten in the other).
 
 5. **Double-cost fallback path.** Whenever the first segmentation attempt
-   yields no sufficiently circular contour, the image is fully
-   reprocessed (segmented again + contours again). If this fallback
-   triggers frequently on your dataset, it's worth instrumenting how often
-   it happens — if it's common, that's more of an *accuracy* signal
-   (the model/threshold isn't robust enough for a meaningful fraction of
-   your images) than a performance one.
+   yields no acceptable contour, the image is fully reprocessed (segmented
+   again + contours again). If this fallback triggers frequently on your
+   dataset, it's worth instrumenting how often it happens — if it's
+   common, that's more of an *accuracy* signal (the model/threshold isn't
+   robust enough for a meaningful fraction of your images) than a
+   performance one. On a 7-image problematic sample, the old
+   circularity-union logic triggered this on 2/7 images; the new
+   `select_best_contour` logic triggered it on 0/7 (see §6.3) — a case
+   where an accuracy fix directly improves throughput too.
 
 ## 5. Recommendations
 
@@ -205,26 +241,123 @@ they target the constant factor and robustness:
   metric. A high rate would indicate the segmentation model itself needs
   retraining/improvement for accuracy, which batching/GPU work won't fix.
 
-**Lower priority / accuracy-focused (not performance):**
-- **Consider skip connections (U-Net-style)** between encoder and decoder
-  layers in `SegmenterModel`. The current architecture has none, so all
-  boundary detail must be reconstructed from a 7×7×512 bottleneck; skip
-  connections typically improve mask boundary precision substantially in
-  segmentation networks, at a modest compute cost (still well under 1
-  GFLOP total).
-- **Revisit the fixed thresholds** (mask binarization at 0.5,
-  `min_circularity = 0.7`). These are reasonable heuristics but were
-  presumably tuned on a specific dataset; if your images differ
-  meaningfully (different scope/lighting/magnification), it may be worth
-  re-validating them or making them CLI-configurable rather than hardcoded.
+**Accuracy-focused (minimal performance cost — see §6):**
+- **Port `select_best_contour` + `squarify_bbox`** from
+  `run_segmenter_inspect.py` into `preprocessing_images.py`. Adds
+  ~24 µs/image post-processing but can eliminate costly double forward
+  passes on images where the old circularity filter finds nothing.
 
-## 6. Conclusion
+**Lower priority / accuracy-focused (not performance):**
+- **Consider skip connections (U-Net-style)** in `SegmenterModel` — see
+  §3.1 for the measured cost (+28% CPU inference time, +12.5% parameters;
+  still just +9 ms/image). See the accuracy roadmap for the expected
+  quality benefit and why this is cheaper than a full Inception-module
+  backbone rewrite.
+- **Revisit the fixed thresholds** (mask binarization at 0.5; in
+  production, `min_circularity = 0.7`). The inspect-tool prototype has
+  replaced the circularity threshold entirely with border/size rejection
+  (`max_area_frac=0.9`, `border_margin=2`) — see §6 and the accuracy
+  roadmap for rationale.
+
+## 6. Old vs. New Post-Processing: Performance Comparison
+
+This section compares the **production** contour logic in
+`preprocessing_images.py` against the **Phase 1 prototype** in
+`run_segmenter_inspect.py`. The neural network (`SegmenterModel`) is
+identical in both paths — only the mask-to-bounding-box step differs.
+
+### 6.1 What changed (accuracy side, briefly)
+
+| Step | Old (production) | New (inspect tool prototype) |
+|---|---|---|
+| Contour filter | Union all contours with circularity > 0.7 | Single best contour: prefer non-border-touching, ≤90% frame area; score by area then centrality |
+| Circularity | Used as hard filter | **Not used for selection** (reported as diagnostic only) |
+| Crop resize | Non-square box → force 224×224 (distorts) | `_6` output: `squarify_bbox()` then uniform resize (no distortion) |
+| Faulty-detection flag | None | `possible_background_false_positive` when crop > 70% of frame |
+
+Validated on 7 problematic images: full-image fallback dropped from 1→0,
+brightness fallback 1→0, >70% crop false-positives 1→0 (see accuracy
+roadmap Status table for details).
+
+### 6.2 Per-step micro-benchmark (post-processing only)
+
+Measured on this machine (CPU, synthetic 224×224 masks with 0–5
+contours, 30,000 total calls per variant):
+
+| Variant | Time per image | vs. old |
+|---|---|---|
+| Old: circularity filter + union all passers | **436 µs** | baseline |
+| New: `select_best_contour` | **454 µs** | +4% (~18 µs slower) |
+| New: `select_best_contour` + `squarify_bbox` | **460 µs** | +6% (~24 µs slower) |
+| `SegmenterModel` forward pass (CPU, batch=1) | **32.8 ms** | — |
+
+**Interpretation:** The new logic adds a handful of extra OpenCV calls per
+contour (`boundingRect`, `moments`, `hypot`) and a `max()` over
+candidates instead of a list-comprehension + union draw. In absolute
+terms this is **negligible**: post-processing is ~**1.4%** of per-image
+CPU time (0.46 ms vs 32.8 ms), and the new path is only ~**0.06%** slower
+end-to-end than the old one. **Big-O is unchanged** — still O(1) per
+image, O(k) in the number of contours k where k is bounded by the fixed
+224×224 mask (typically k ≪ 224).
+
+The dominant cost remains the CNN forward pass (~70× more expensive than
+even the slower new post-processing step). GPU batching recommendations
+from §5 therefore still apply unchanged.
+
+### 6.3 Fallback-path throughput (where the new logic can actually save time)
+
+The old logic sometimes finds **no** circularity-passing contour, triggering:
+1. A second full forward pass on a brightness-corrected copy, and/or
+2. A full-frame fallback (`np.ones_like`).
+
+Each triggered fallback **doubles** the CNN cost for that image (second
+forward pass) or wastes crop quality (full frame). On the 7-image
+validation set:
+
+| Fallback | Old logic | New logic |
+|---|---|---|
+| Brightness retry (extra forward pass) | 1 / 7 (14%) | **0 / 7** |
+| Full-image fallback | 1 / 7 (14%) | **0 / 7** |
+
+If fallback rates on a larger dataset are similar, the new post-processing
+can yield a **net throughput win** despite being ~4% slower on the
+post-processing micro-benchmark alone: avoiding one extra 32.8 ms forward
+pass per image saves far more than the ~18 µs added contour scoring costs.
+
+**Rough break-even:** if the new logic avoids a second forward pass on
+≥ 0.06% of images (18 µs / 32.8 ms), it pays for its own extra
+post-processing overhead. On the 7-image sample, 14% of images avoided a
+double pass — a large margin.
+
+### 6.4 Memory and I/O (inspect tool only)
+
+`run_segmenter_inspect.py` writes 6 PNG artifacts per image for manual
+review. That extra disk I/O is **not** part of the production
+post-processing cost model and should not be counted when estimating
+batch-preprocessing throughput. Production `preprocessing_images.py`
+would only pay the `select_best_contour` + `squarify_bbox` CPU cost if
+ported.
+
+**Bottom line: no new bottlenecks.** Porting `select_best_contour` +
+`squarify_bbox` to production is safe from a performance perspective —
+negligible added CPU cost (§6.2), and may reduce fallback-triggered double
+inference (§6.3). GPU batching and multiprocessing hygiene (§5) remain the
+primary speed levers regardless of which contour logic runs.
+
+## 7. Conclusion
 
 The segmenter pipeline's asymptotic complexity — O(1) per image, O(N)
 overall — is already as good as it can be for a per-image, independent
 preprocessing task; **no algorithmic rewrite is needed or would help**.
 The opportunities for "improving efficiency" identified in this analysis
 are all constant-factor engineering improvements (GPU batching being the
-highest-leverage one), and the opportunities for "improving accuracy" are
-architectural/heuristic-tuning questions (skip connections, threshold
-tuning, monitoring the fallback rate) rather than complexity questions.
+highest-leverage one).
+
+The Phase 1 accuracy fixes prototyped in `run_segmenter_inspect.py` **do
+not materially change that picture**: post-processing remains O(1) and
+sub-millisecond, ~70× cheaper than inference, and the new contour logic
+is within a few percent of the old step on a micro-benchmark while
+potentially **reducing end-to-end time** on datasets where the old
+circularity-union logic frequently triggers the double-pass fallback.
+Port these fixes to production for the accuracy win; pursue GPU batching
+and multiprocessing hygiene for the speed win.
