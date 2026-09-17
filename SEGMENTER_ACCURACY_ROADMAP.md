@@ -23,8 +23,10 @@ Phase 1 fixes below are ported over.
 | Phase 1(c): morphological closing before contour-finding | **Not yet** | — |
 | Phase 1(d): bounding-box safety margin | **Not yet** | — |
 | Port Phase 1 fixes into `preprocessing_images.py` | **Not yet** | Next step for production |
+| Phase 1(b) noise-speck bug: a tiny non-border-touching speck could beat a much larger, genuine border-touching contour | **Fixed** | `select_best_contour(min_area_frac=0.01)` — see Root cause B |
 | Cross-check against the published methodology (Rajendran et al. 2025) | **Done** | §3 below |
 | Segmenter training/fine-tuning pipeline | **Done** | `train_segmenter.py` (didn't exist before — see §4 Option B) |
+| Skip connections (U-Net variant, root cause C) | **Done, opt-in** | `train_segmenter.py --skip-connections` (`SegmenterModelSkip`); `run_segmenter_inspect.py` auto-detects and loads either architecture. Off by default — see caveat below Root cause C. |
 | Labeled dataset: original 30-pair paper dataset recovered + 10 new labeled pairs | **Done** | `mask/` + `mask_valid/` (23 train / 5 val) + `new_labels/` (10 pairs) — 38 total |
 
 ### Validated on 7 problematic production images (`problematic_raw_images/`)
@@ -175,6 +177,22 @@ almost always (a) is far larger than a typical embryo relative to the
 frame and (b) touches or nearly touches the image border — both are easy,
 cheap signals to reject it that the current code doesn't use at all.
 
+**Noise-speck corollary (found & fixed while comparing `SegmenterModelSkip`
+against production on `92442871_0393_134.8_HB_0.jpg`):** `select_best_contour()`'s
+border-preference rule ("prefer non-border-touching candidates over
+border-touching ones") only falls back to considering border-touching
+candidates when the preferred pool is completely *empty*. That meant a
+single tiny (e.g. 4-pixel) spurious blob elsewhere in the frame — which
+happens not to touch the border — was enough to make it the *entire*
+preferred pool, unconditionally beating a >5000x larger, genuine embryo
+contour that was only disqualified for grazing the frame edge by 1-2
+pixels. Confirmed by direct contour inspection on the raw mask (1 real
+contour + 4 near-zero-area specks). **Fixed** by discarding contours below
+`min_area_frac` (default 1% of frame area) *before* applying the
+border/size preference logic, so a noise speck can no longer win by
+default — the real, larger contour still correctly falls back to being
+selected when it's the only substantial candidate, border-touching or not.
+
 ### Root cause C — the model's raw mask recall is genuinely incomplete
 
 Even before contour filtering, the network may under-predict the embryo's
@@ -192,12 +210,22 @@ missing). Plausible contributing factors given the architecture (see
   time (+9 ms/image), +12.5% parameters** (see
   [`SEGMENTER_PERFORMANCE_ANALYSIS.md`](SEGMENTER_PERFORMANCE_ANALYSIS.md)
   §3.1) — cheap, and most of the current production checkpoint's weights
-  can be reused (only 4 of 12 layers change shape). A full real-Inception
-  backbone (optionally ImageNet-pretrained) would cost far more compute
-  (~24M params / ~5.7 GFLOPs vs. ~3.1M / ~1.2 GFLOPs) and, more
-  importantly, carries real overfitting risk given the ~38 labeled
-  examples currently available (see §4 Option C item 3 for the full
-  comparison) — start with skip connections alone.
+  can be reused (only 5 conv-weight tensors change shape; 67 of ~72 weight
+  tensors transfer directly, including the encoder and all BatchNorm
+  params). **Implemented as an opt-in flag** (`train_segmenter.py
+  --skip-connections`, `SegmenterModelSkip`) — see §4 Option C item 3 for
+  the caveat that emerged from actually testing it: with only ~38 labeled
+  examples and `--freeze-encoder`, the 5 newly-shaped decoder layers start
+  from random initialization and had visibly noisier raw output on at
+  least one held-out image than the fully-pretrained production decoder
+  (see the noise-speck corollary under Root cause B, found via this exact
+  comparison) — this is a data/convergence issue, not evidence against
+  skip connections as an idea. A full real-Inception backbone (optionally
+  ImageNet-pretrained) would cost far more compute (~24M params / ~5.7
+  GFLOPs vs. ~3.1M / ~1.2 GFLOPs) and carries even more overfitting risk
+  given the same ~38 examples (see §4 Option C item 3 for the full
+  comparison) — start with skip connections alone, and only once there's
+  enough data/epochs for the new layers to actually converge.
 - Fixed 0.5 sigmoid threshold may cut off legitimately-embryo but
   lower-confidence pixels, which are more likely to occur at the
   periphery of the embryo (e.g. a fainter lower boundary due to lighting
@@ -505,20 +533,32 @@ Roughly ordered from cheapest/fastest to most involved:
    of both attempts' contours (rather than either/or) could recover
    embryo area that's only visible in one of the two versions.
 3. **Add skip connections to `SegmenterModel`** (turn it into a real
-   U-Net, keeping its current lightweight conv blocks). Measured cost:
-   **+28% CPU inference time (+9 ms/image), +12.5% parameters** (see
-   performance doc §3.1) — directly targets root cause C's
-   boundary-precision limitation, needs no new framework (still plain
-   PyTorch, plugs into `train_segmenter.py` as-is), and most of the
-   current checkpoint's weights transfer directly (only 4 of 12 layers
-   change shape). **Recommended as the first architecture change to try.**
-   A further, separate option — replacing the encoder with a *real*
-   Inception-module backbone (optionally ImageNet-pretrained), matching
-   what the paper's "InceptionV3" name implies (see §3, item #1) — would
-   cost far more (~24M params / ~5.7 GFLOPs vs. ~3.1M / ~1.2 GFLOPs, an
-   ~8×/~5× jump) and risks overfitting given the ~38 labeled examples
-   currently available; only worth it with substantially more data or
-   heavy layer-freezing.
+   U-Net, keeping its current lightweight conv blocks). **Done** —
+   implemented as `train_segmenter.py --skip-connections`
+   (`SegmenterModelSkip`, defined in that file; the production
+   `SegmenterModel.py` is untouched, so nothing changes unless this flag
+   is explicitly used). Measured cost: **+28% CPU inference time (+9
+   ms/image), +12.5% parameters** (see performance doc §3.1); only 5
+   conv-weight tensors differ in shape from the production checkpoint, so
+   fine-tuning still starts from mostly-pretrained weights, not from
+   scratch. **Caveat found by actually testing it:** with only ~38 labeled
+   examples and `--freeze-encoder`, the 5 newly-shaped decoder layers
+   start randomly initialized and, at least on one held-out image, this
+   produced a visibly noisier raw mask than the fully-pretrained
+   production decoder — which, combined with the noise-speck bug fixed
+   under Root cause B, made the fine-tuned skip model look *worse* on
+   that image even though its raw mask shape was comparable. This isn't
+   evidence against skip connections; it means the new capacity needs
+   more data/epochs (or an unfrozen encoder) to actually converge before
+   a fair comparison against production is possible — re-run
+   `run_segmenter_inspect.py` (now with the noise-speck fix) on a larger
+   held-out set after further training. A further, separate option —
+   replacing the encoder with a *real* Inception-module backbone
+   (optionally ImageNet-pretrained), matching what the paper's
+   "InceptionV3" name implies (see §3, item #1) — would cost far more
+   (~24M params / ~5.7 GFLOPs vs. ~3.1M / ~1.2 GFLOPs, an ~8×/~5× jump)
+   and risks overfitting even more given the same ~38 examples; only
+   worth it with substantially more data or heavy layer-freezing.
 4. **Use a pretrained/foundation segmentation model** (e.g. Meta's
    Segment Anything Model, SAM/SAM2) prompted with a rough
    center-point/box, either as the production model (if latency budget
@@ -554,7 +594,7 @@ Roughly ordered from cheapest/fastest to most involved:
 |---|---|---|---|
 | **0. Diagnose** | Hours | Instrument `process_image` to log/save, per image: (a) fraction of frame area covered by the final crop; (b) whether the final box touches any image border; (c) how often the brightness-retry and full-image fallbacks trigger; (d) mask/bbox visualizations for manual review. | **Largely done** in `run_segmenter_inspect.py` (6 diagnostic PNGs per image + console metrics). Still worth porting the same logging into `preprocessing_images.py` for batch runs. |
 | **1. Quick wins** | Days | **(a)** Square up the bounding box before cropping/resizing (root cause F). **(b)** Replace circularity-union with single best-contour selection (no circularity; border/size rejection + area/centrality scoring). **(c)** Morphological closing. **(d)** Bounding-box safety margin. | **(a) and (b) done in inspect tool**, validated on 7 problematic images (see Status table above). **(c) and (d) not yet.** Next: port (a)+(b) into `preprocessing_images.py`, then re-run diagnostics at scale. Zero retraining required. |
-| **2. Architecture** | Days–1 week | `train_segmenter.py` and the labeled dataset already exist (see Status table), so this is mainly a model-code change: add skip connections to `SegmenterModel` (+28% inference cost, +12.5% params — see performance doc §3.1) and fine-tune, reusing most of the current checkpoint. | Cheapest architecture fix for root cause C; directly addresses the paper's "U-Net" gap. |
+| **2. Architecture** | Days–1 week | **Done, opt-in** (`train_segmenter.py --skip-connections`, +28% inference cost, +12.5% params — see performance doc §3.1), reusing most of the current checkpoint. Remaining work: train with enough data/epochs (or an unfrozen encoder) for the new layers to actually converge, then re-validate with `run_segmenter_inspect.py` on a larger held-out set — see the caveat under Root cause C / Option C item 3. | Cheapest architecture fix for root cause C; directly addresses the paper's "U-Net" gap. |
 | **2b. Bigger architecture bet (optional, defer)** | 1–3 weeks | Either (a) a real Inception-module backbone (optionally ImageNet-pretrained — a much bigger jump, ~8×/~5× more params/FLOPs, needs careful freezing given current data scale), or (b) converting existing masks to boxes and training a lightweight detector (YOLO-nano class) instead — informed by Phase 2's results and Phase 0's diagnostics. | Only pursue once Phase 2's cheaper fix has been tried and/or the labeled dataset has grown meaningfully. |
 | **3. Targeted data expansion** | Ongoing | Use Phase 0's hard-example flags (plus any new failures found after Phase 1/2) to drive **targeted** new data collection/labeling — ideally as cheap bounding boxes rather than full masks (per §1), explicitly including "hard negative" frames with a visible dish rim/vignette so the model learns to ignore them, optionally accelerated by a prompted foundation model (SAM) to speed up annotation. Separately, audit and flag/exclude source images where the embryo appears genuinely clipped at acquisition time (root cause D) — this is a data-quality fix, not a model-training fix. Retrain periodically as new hard examples accumulate. | Highest long-term payoff, but should be targeted at known failure modes rather than done blindly, and is naturally an ongoing process rather than a one-time fix. |
 | **4. Re-validate efficiency** | Days | Once a new model is chosen, re-run the efficiency analysis from `SEGMENTER_PERFORMANCE_ANALYSIS.md` (GPU batching, thread settings, etc.) against the new model to confirm the constant-factor recommendations still apply. | Efficiency work is largely orthogonal to the model architecture (per that doc) — worth confirming rather than assuming after a model swap. |

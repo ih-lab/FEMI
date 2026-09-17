@@ -31,6 +31,14 @@ because that script runs directory-listing and model-loading side effects
 at import time (it's a script, not a library) — production still uses the
 old circularity-union logic until that fix is ported over there too.
 
+Model loading (`load_model()` below) auto-detects, from the checkpoint's
+own tensor shapes, whether `--weights` points at a plain `SegmenterModel`
+checkpoint or a `SegmenterModelSkip` (U-Net, skip-connection) checkpoint
+produced by `train_segmenter.py --skip-connections` (that class IS imported
+from `train_segmenter.py`, unlike the segmentation logic above — it's just
+a model definition with no side effects at import time). No flag needed;
+just point `--weights` at either kind of checkpoint.
+
 For each input image, this script saves 6 files to --output-dir:
   <stem>_1_input.png              the 224x224 resized image actually fed to the model
   <stem>_2_raw_mask.png           the raw thresholded model mask (before contour selection)
@@ -90,12 +98,47 @@ import torch
 from PIL import Image
 
 from EmbryoSegmenter.SegmenterModel import SegmenterModel
+from train_segmenter import SegmenterModelSkip
 
 DEFAULT_WEIGHTS = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
     "EmbryoSegmenter", "weights", "epoch_102_loss_0.098710.pt",
 )
 SUPPORTED_EXTS = (".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp")
+
+
+def load_model(weights_path):
+    """
+    Load a segmenter checkpoint, auto-detecting whether it's the production
+    `SegmenterModel` architecture or the `SegmenterModelSkip` (U-Net, skip
+    connections) variant trained via `train_segmenter.py --skip-connections`
+    — see that file for the SegmenterModelSkip class itself
+    (`EmbryoSegmenter/SegmenterModel.py` has no skip-connection variant, by
+    design). The two are distinguished by `deconv4.conv.weight`'s input
+    channel count (256 = no skip, 512 = skip, since skip connections
+    concatenate deconv5's 256-channel output with conv5's 256-channel
+    feature map). Auto-detecting means callers don't need to track which
+    architecture a given .pt file was trained with.
+    """
+    state_dict = torch.load(weights_path, map_location="cpu")
+    try:
+        deconv4_in_channels = state_dict["deconv4.conv.weight"].shape[1]
+    except KeyError:
+        raise ValueError(
+            f"{weights_path} does not look like a SegmenterModel/SegmenterModelSkip "
+            f"checkpoint (missing 'deconv4.conv.weight').")
+    if deconv4_in_channels == 256:
+        model = SegmenterModel()
+    elif deconv4_in_channels == 512:
+        model = SegmenterModelSkip()
+    else:
+        raise ValueError(
+            f"{weights_path} has an unrecognized deconv4 input channel count "
+            f"({deconv4_in_channels}; expected 256 for SegmenterModel or 512 for "
+            f"SegmenterModelSkip).")
+    model.load_state_dict(state_dict)
+    model.eval()
+    return model
 
 
 def load_image(image_path, size=(224, 224)):
@@ -186,7 +229,7 @@ def find_bounding_box(mask):
     return (min_x, min_y, max_x, max_y)
 
 
-def select_best_contour(mask, max_area_frac=0.9, border_margin=2):
+def select_best_contour(mask, max_area_frac=0.9, border_margin=2, min_area_frac=0.10):
     """
     Fixed replacement for production's `filter_mask_by_circularity`
     (root causes A/B in SEGMENTER_ACCURACY_ROADMAP.md). Instead of taking
@@ -194,7 +237,10 @@ def select_best_contour(mask, max_area_frac=0.9, border_margin=2):
     threshold, this picks a SINGLE best-candidate contour, and does not
     use circularity at all:
 
-      1. Find all external contours in the raw thresholded mask.
+      0. Discard contours smaller than `min_area_frac` of the frame before
+         anything else (see "noise-speck bug" note below) — these are
+         essentially always thresholding noise, never a real embryo.
+      1. Find all remaining external contours in the raw thresholded mask.
       2. Prefer contours that (a) do NOT touch/nearly touch the image
          border, and (b) are not implausibly large (> `max_area_frac` of
          the frame). A petri dish rim or the microscope's light vignette
@@ -213,6 +259,21 @@ def select_best_contour(mask, max_area_frac=0.9, border_margin=2):
       4. Draw ONLY that one contour (filled) onto the output mask — no
          union with any other contour.
 
+    Noise-speck bug (found while comparing SegmenterModelSkip against
+    production on 92442871_0393_134.8_HB_0.jpg): step 0 didn't originally
+    exist. Without it, if the raw mask contains ANY tiny spurious blob that
+    happens to not touch the border (e.g. a few stray pixels above the 0.5
+    threshold - more likely from a less-converged model, but possible from
+    any model), step 2's "prefer border-safe candidates" rule made that
+    4-pixel speck the entire `preferred` pool, so it won unconditionally
+    over the real embryo even when the real embryo was 5000x larger and
+    only disqualified for grazing the frame edge by 1-2 pixels. The
+    fallback-to-all-candidates path in step 3 only fires when `preferred`
+    is completely EMPTY, so a single noise speck was enough to suppress it.
+    Filtering by minimum area FIRST closes this: a real embryo can still
+    touch the border and fall back to being selected via step 3, but a
+    speck below `min_area_frac` can never win by simply being "safe".
+
     Returns (final_mask, selected_contour) where final_mask matches the
     input mask's shape/dtype convention (float, 0.0/1.0) and
     selected_contour is None if no contour was found at all.
@@ -222,12 +283,22 @@ def select_best_contour(mask, max_area_frac=0.9, border_margin=2):
     contours, _ = cv2.findContours(cv2mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     final_mask = np.zeros_like(cv2mask)
 
-    candidates = [cnt for cnt in contours if cv2.contourArea(cnt) > 0]
-    if not candidates:
-        return (final_mask / 255.0).astype(float), None
-
     frame_area = float(w * h)
     frame_cx, frame_cy = w / 2.0, h / 2.0
+
+    all_candidates = [cnt for cnt in contours if cv2.contourArea(cnt) > 0]
+    if not all_candidates:
+        return (final_mask / 255.0).astype(float), None
+
+    # Step 0: drop noise specks (see "Noise-speck bug" above) BEFORE the
+    # border-preference logic, so a tiny stray blob can never out-rank a
+    # much larger, genuine (if border-touching) detection just by being
+    # "safe". Falls back to the unfiltered list in the (should-be-rare)
+    # case where EVERY contour is below the area floor.
+    min_area = min_area_frac * frame_area
+    candidates = [cnt for cnt in all_candidates if cv2.contourArea(cnt) >= min_area]
+    if not candidates:
+        candidates = all_candidates
 
     def touches_border(cnt):
         x, y, bw, bh = cv2.boundingRect(cnt)
@@ -310,7 +381,7 @@ def to_bgr_uint8(img):
 
 
 def process_one_image(model, img_path, output_dir, max_area_frac=0.9, border_margin=2,
-                       background_area_flag_threshold=0.7):
+                       background_area_flag_threshold=0.7, min_area_frac=0.1):
     stem = os.path.splitext(os.path.basename(img_path))[0]
     diagnostics = {
         "image": img_path,
@@ -324,13 +395,13 @@ def process_one_image(model, img_path, output_dir, max_area_frac=0.9, border_mar
         return diagnostics
 
     raw_mask = segment_image(model, img)
-    final_mask, selected_contour = select_best_contour(raw_mask, max_area_frac, border_margin)
+    final_mask, selected_contour = select_best_contour(raw_mask, max_area_frac, border_margin, min_area_frac)
 
     if np.max(final_mask) == 0:
         diagnostics["fallback_brightness_triggered"] = True
         bright_img = automatic_brightness_and_contrast(img)
         raw_mask = segment_image(model, bright_img)
-        final_mask, selected_contour = select_best_contour(raw_mask, max_area_frac, border_margin)
+        final_mask, selected_contour = select_best_contour(raw_mask, max_area_frac, border_margin, min_area_frac)
         if np.sum(final_mask) == 0:
             diagnostics["fallback_full_image_triggered"] = True
             final_mask = np.ones_like(final_mask)
@@ -415,6 +486,13 @@ def main():
     parser.add_argument("--border-margin", type=int, default=2,
                         help="Pixel margin used to decide whether a candidate contour "
                              "touches the image border (default: 2). See select_best_contour().")
+    parser.add_argument("--min-area-frac", type=float, default=0.01,
+                        help="Discard candidate contours smaller than this fraction of the "
+                             "frame BEFORE applying the border/size preference logic (default: "
+                             "0.1, i.e. 10%%). Without this, a tiny noise speck that happens to "
+                             "not touch the border can beat a much larger, genuine detection "
+                             "that grazes the border by a couple pixels - see the 'Noise-speck "
+                             "bug' note in select_best_contour().")
     parser.add_argument("--background-area-flag-threshold", type=float, default=0.7,
                         help="Flag an image's 'possible_background_false_positive' diagnostic "
                              "if the final crop covers more than this fraction of the frame "
@@ -432,10 +510,8 @@ def main():
         sys.exit(1)
 
     print(f"Loading segmenter weights from {args.weights} ...")
-    model = SegmenterModel()
-    model.load_state_dict(torch.load(args.weights, map_location="cpu"))
-    model.eval()
-    print("Model loaded.\n")
+    model = load_model(args.weights)
+    print(f"Model loaded ({type(model).__name__}).\n")
 
     all_diagnostics = []
     for img_path in image_paths:
@@ -446,7 +522,8 @@ def main():
         diag = process_one_image(model, img_path, args.output_dir,
                                   max_area_frac=args.max_area_frac,
                                   border_margin=args.border_margin,
-                                  background_area_flag_threshold=args.background_area_flag_threshold)
+                                  background_area_flag_threshold=args.background_area_flag_threshold,
+                                  min_area_frac=args.min_area_frac)
         all_diagnostics.append(diag)
         for k, v in diag.items():
             if k != "image":

@@ -7,3 +7,6 @@ numpy==1.26.4
 pillow==10.4.0
 opencv-python-headless==4.10.0.84
 torch==2.3.0
+# Only needed for train_segmenter.py's end-of-run training-curve plot
+# (plot_training_curves) - not required for inference/inspection.
+matplotlib==3.9.2
