@@ -1,16 +1,14 @@
 """
 train_segmenter.py
 
-Training/fine-tuning script for `EmbryoSegmenter/SegmenterModel.py`. This
-did not exist before — there was no training pipeline for this component
-in the repo (see SEGMENTER_ACCURACY_ROADMAP.md, "no existing segmenter
-training script or dataset"). This fills that gap, and is designed to
-plug directly into `labelme_json_to_mask.py`'s output convention:
-  - masks are single-channel 0/255 PNGs named "<image_stem>_mask.png"
-    (configurable suffix), at the ORIGINAL image resolution (not resized).
-  - this script resizes each image/mask pair together at load time
-    (image: bilinear, mask: nearest, to keep the mask binary), so mask and
-    image always end up pixel-aligned regardless of source resolution.
+Training/fine-tuning script for `EmbryoSegmenter/SegmenterModel.py`. Fills
+a gap noted in SEGMENTER_ACCURACY_ROADMAP.md ("no existing segmenter
+training script or dataset"), and plugs directly into
+`labelme_json_to_mask.py`'s output convention: masks are single-channel
+0/255 PNGs named "<image_stem>_mask.png", at the ORIGINAL image resolution.
+This script resizes each image/mask pair together at load time (image:
+bilinear, mask: nearest), so mask and image always end up pixel-aligned
+regardless of source resolution.
 
 Handling "some existing masks are inaccurate": pass MULTIPLE
 --images-dir/--masks-dir pairs (or --manifest rows). Pairs are matched by
@@ -23,44 +21,26 @@ corrected masks directory LAST:
         --images-dir /path/to/new/raw_images --masks-dir preprocessing/masks
 
 Only run this on machines/environments where you're comfortable running
-model training (needs more compute than the inference-only tools in this
-directory, though the model is still small — see SEGMENTER_PERFORMANCE_ANALYSIS.md).
-No new dependencies beyond what's already in requirements-segmenter.txt
-(torch, numpy, pillow) — OpenCV is not needed for training.
+model training (needs more compute than this directory's inference-only
+tools - see SEGMENTER_PERFORMANCE_ANALYSIS.md). No new dependencies beyond
+requirements-segmenter.txt (torch, numpy, pillow) - OpenCV not needed.
 
-Fidelity to the original method (Rajendran et al. 2025, "A foundational
-model for in vitro fertilization trained on 18 million time-lapse
-images", Nature Communications, Methods -> "Datasets and
-preprocessing"): the paper states the original segmenter was an
-"InceptionV3 U-Net" trained on 30 image-mask pairs with an 80/20 train/val
-split and "random cropping, flipping, rotation, and translation"
-augmentation. This script matches the split ratio (--val-frac default
-0.2) and augmentation types (crop/flip/rotation; "translation" is
-approximated via the crop's random offset - see SegmentationDataset). It
-does NOT fully reproduce two things: (1) the paper's "InceptionV3 U-Net"
-implies both skip connections AND real multi-branch Inception modules;
-`SegmenterModel.py` (left unchanged) has neither, and --skip-connections
-below only closes the first, cheaper gap (see SEGMENTER_ACCURACY_ROADMAP.md
-§3 and Root cause C for why the second is a separate, much more expensive
-change); (2) the paper does not state a loss function, optimizer, learning
-rate, or epoch count for the segmenter specifically, so --loss/--lr/--epochs
-below are reasonable defaults, not values taken from the paper. Iteratively
-fine-tuning an existing checkpoint on newly corrected masks (this script's
-core use case) is not described in the paper at all - it only documents
-one training run on the original 30 pairs.
+Fidelity to the original method (Rajendran et al. 2025) and what this
+script does/doesn't reproduce: see SEGMENTER_ACCURACY_ROADMAP.md §3. In
+short, --val-frac (default 0.2) and the augmentation set (crop/flip/
+rotation, approximating "translation" - see SegmentationDataset) match the
+paper's stated 80/20 split and augmentation types; --skip-connections
+(below) closes part of the paper's "U-Net" gap but not all of it; loss/lr/
+epoch count are this script's own defaults, not values from the paper.
 
 Skip connections (--skip-connections): trains `SegmenterModelSkip`, a
-U-Net variant of `SegmenterModel` DEFINED IN THIS FILE (not in
-EmbryoSegmenter/SegmenterModel.py, which is left untouched, per design -
-see that class's docstring below). Off by default, so the default
-behavior of this script stays a like-for-like fine-tune of the current
-production architecture; pass --skip-connections to opt into the new one.
-Most of --init-weights still transfers (only 5 conv-weight tensors differ
-in shape - see `load_compatible_state_dict`). Measured cost: +28% CPU
-inference time, +12.5% parameters (SEGMENTER_PERFORMANCE_ANALYSIS.md
-§3.1). run_segmenter_inspect.py auto-detects skip-connection checkpoints
-saved by this flag (it imports SegmenterModelSkip from this file) and
-loads them transparently, no extra flag needed there.
+U-Net variant of `SegmenterModel` DEFINED IN THIS FILE (EmbryoSegmenter/
+SegmenterModel.py is left untouched - see that class's docstring below).
+Off by default. Most of --init-weights still transfers (see
+`load_compatible_state_dict`); run_segmenter_inspect.py auto-detects and
+loads these checkpoints transparently. Cost/rationale: see
+SEGMENTER_ACCURACY_ROADMAP.md Root cause C and
+SEGMENTER_PERFORMANCE_ANALYSIS.md §3.1.
 
 Using the ORIGINAL 30-pair dataset (if you have it): unlike
 labelme_json_to_mask.py's output, the original dataset's masks are
@@ -68,17 +48,15 @@ typically plain JPEGs named identically to the raw image (no "_mask"
 suffix, e.g. "foo.jpg" raw + "foo.jpg" mask in a separate folder), not
 "_mask.png". Use --mask-suffix "" --mask-ext .jpg to match that layout.
 Mask pixel values don't need to be clean 0/255 - SegmentationDataset
-resizes masks with nearest-neighbor (introducing no new intermediate
-values) and thresholds at 127 when building the training tensor, so mild
-JPEG compression artifacts in the source mask do not affect training. If
-the original data also came with its own pre-defined train/validation
-split (e.g. separate "mask" and "mask_valid" folders, matching the
-paper's 80/20 split), pass the validation folder(s) via
---val-images-dir/--val-masks-dir to use that split directly instead of
---val-frac's random shuffle - see example 4 below. That folder alone can
-be tiny (e.g. 5 images) and give a noisy validation signal; add
---extra-val-frac to pull additional examples from the training pool into
-validation too (see that flag's help text and `plot_training_curves`).
+resizes masks with nearest-neighbor and thresholds at 127 when building
+the training tensor, so mild JPEG artifacts in the source mask don't
+affect training. If the original data also came with its own pre-defined
+train/validation split (e.g. separate "mask" and "mask_valid" folders),
+pass the validation folder(s) via --val-images-dir/--val-masks-dir to use
+that split directly instead of --val-frac's random shuffle - see example 4
+below. That folder alone can be tiny and give a noisy validation signal;
+add --extra-val-frac to pull additional examples from the training pool
+into validation too (see that flag's help text and `plot_training_curves`).
 
 Monitoring for overfitting: by default (unless --no-plot is passed), a
 training_curves.png (train vs. val loss/dice/IoU per epoch) and
@@ -157,12 +135,9 @@ class SegmenterModelSkip(nn.Module):
     `BasicConv2d`/`BasicConv2dSigmoid` building blocks, but each decoder
     stage concatenates the matching encoder stage's pre-pool feature map
     (a "skip connection") before its conv, so boundary detail doesn't have
-    to be reconstructed from the 7x7x512 bottleneck alone. This is closer
-    to what the paper's "InceptionV3 U-Net" description implies (see
-    SEGMENTER_ACCURACY_ROADMAP.md §3 and Root cause C) - though it still
-    doesn't use real multi-branch Inception modules, just this repo's
-    existing lightweight conv blocks (see that same doc section for why
-    that's a separate, much more expensive gap to close).
+    to be reconstructed from the 7x7x512 bottleneck alone. Rationale and
+    cost: see SEGMENTER_ACCURACY_ROADMAP.md Root cause C and
+    SEGMENTER_PERFORMANCE_ANALYSIS.md §3.1.
 
     Only 5 of ~72 weight tensors differ in shape from `SegmenterModel`: the
     `conv.weight` of `deconv4`/`deconv3`/`deconv2`/`deconv1`/`decoded` (their
@@ -173,9 +148,6 @@ class SegmenterModelSkip(nn.Module):
     matches `SegmenterModel` exactly by name and shape. See
     `load_compatible_state_dict` below, which uses this to fine-tune from
     the existing production checkpoint instead of training from scratch.
-
-    Measured cost vs. `SegmenterModel` (SEGMENTER_PERFORMANCE_ANALYSIS.md
-    §3.1): +28% CPU inference time (+9 ms/image), +12.5% parameters.
     """
 
     def __init__(self):
@@ -666,15 +638,12 @@ def main():
     parser.add_argument("--skip-connections", action="store_true",
                         help="Train SegmenterModelSkip (defined in this script) instead of "
                              "the production SegmenterModel - a U-Net variant with skip "
-                             "connections between encoder and decoder, matching the paper's "
-                             "'InceptionV3 U-Net' description more closely (see "
-                             "SEGMENTER_ACCURACY_ROADMAP.md Root cause C). Measured cost: "
-                             "+28%% CPU inference time, +12.5%% parameters (see "
-                             "SEGMENTER_PERFORMANCE_ANALYSIS.md §3.1). Unless --from-scratch "
-                             "is also given, most of --init-weights transfers directly (only "
-                             "5 conv-weight tensors differ in shape - see "
-                             "load_compatible_state_dict). run_segmenter_inspect.py "
-                             "auto-detects and loads checkpoints saved with this flag.")
+                             "connections (see SegmenterModelSkip docstring above and "
+                             "SEGMENTER_ACCURACY_ROADMAP.md Root cause C for rationale/cost). "
+                             "Unless --from-scratch is also given, most of --init-weights "
+                             "transfers directly (see load_compatible_state_dict). "
+                             "run_segmenter_inspect.py auto-detects and loads checkpoints "
+                             "saved with this flag.")
     parser.add_argument("--freeze-encoder", action="store_true",
                         help="Freeze encoder layers (conv1-conv6), fine-tune only the decoder. "
                              "Recommended if you only have a handful of new corrected examples, "

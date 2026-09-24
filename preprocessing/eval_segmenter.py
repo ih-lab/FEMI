@@ -35,16 +35,14 @@ Quantitative benchmarking for `EmbryoSegmenter/SegmenterModel.py` (and its
 
 Both modes share the same low-level pipeline primitives, which now live
 ONLY in this file (moved from `run_segmenter_inspect.py`, which imports them
-back - see that file's updated docstring): `load_model`, `load_image`,
-`segment_image`, `calculate_circularity`, `automatic_brightness_and_contrast`,
-`find_bounding_box`, `select_best_contour`, `squarify_bbox`. Config A's
-circularity-union filter (`filter_mask_by_circularity_union`) is ALSO
-duplicated here from `preprocessing_images.py`, for the same reason
-`run_segmenter_inspect.py` already duplicates (rather than imports) that
-file's logic: `preprocessing_images.py` runs model-loading/directory-listing/
-`ProcessPoolExecutor` as top-level side effects at import time and uses
-placeholder paths, so it is not safely importable - see that file's module
-docstring.
+back): `load_model`, `load_image`, `segment_image`, `calculate_circularity`,
+`automatic_brightness_and_contrast`, `find_bounding_box`,
+`select_best_contour`, `squarify_bbox`. Config A's circularity-union filter
+(`filter_mask_by_circularity_union`) is ALSO duplicated here from
+`preprocessing_images.py` rather than imported from it, since that file runs
+model-loading/directory-listing/`ProcessPoolExecutor` as top-level side
+effects at import time and uses placeholder paths - see that file's module
+docstring for detail.
 
 Reuses this repo's existing conventions rather than reinventing them:
   - Pair discovery (--mode model): `discover_pairs()` from `train_segmenter.py`
@@ -135,13 +133,6 @@ import os
 import sys
 import time
 import warnings
-
-# automatic_brightness_and_contrast() below (copied verbatim from
-# preprocessing_images.py for behavioral fidelity) triggers a harmless
-# NumPy scalar-conversion DeprecationWarning; silenced here for cleaner
-# console output. This does not affect any computed values. (Moved here
-# from run_segmenter_inspect.py along with the function itself.)
-warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 import cv2
 import numpy as np
@@ -275,9 +266,13 @@ def automatic_brightness_and_contrast(image, clip_hist_percent=10):
     hist = cv2.calcHist([gray], [0], None, [256], [0, 256])
     hist_size = len(hist)
 
-    accumulator = [float(hist[0])]
-    for index in range(1, hist_size):
-        accumulator.append(accumulator[index - 1] + float(hist[index]))
+    # float(hist[index]) below triggers a harmless NumPy scalar-conversion
+    # DeprecationWarning; silenced locally so it doesn't affect callers.
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=DeprecationWarning)
+        accumulator = [float(hist[0])]
+        for index in range(1, hist_size):
+            accumulator.append(accumulator[index - 1] + float(hist[index]))
 
     maximum = accumulator[-1]
     clip_hist_percent *= (maximum / 100.0)
@@ -321,39 +316,20 @@ def select_best_contour(mask, max_area_frac=0.9, border_margin=2, min_area_frac=
     best-candidate contour, and does not use circularity at all:
 
       0. Discard contours smaller than `min_area_frac` of the frame before
-         anything else (see "noise-speck bug" note below) - these are
-         essentially always thresholding noise, never a real embryo.
+         anything else - a cheap noise-speck guard (see
+         SEGMENTER_ACCURACY_ROADMAP.md Root cause B for why this has to run
+         before step 2, not after).
       1. Find all remaining external contours in the raw thresholded mask.
       2. Prefer contours that (a) do NOT touch/nearly touch the image
          border, and (b) are not implausibly large (> `max_area_frac` of
-         the frame). A petri dish rim or the microscope's light vignette
-         almost always trips at least one of these checks; a real embryo
-         (even off-center) usually trips neither. Unlike circularity, this
-         makes no assumption about the embryo's shape, so it works equally
-         well for round, hatching, or multi-cell embryos.
+         the frame) - a petri dish rim or light vignette almost always
+         trips one of these checks, while a real embryo (even off-center,
+         even non-circular) usually trips neither.
       3. Among the surviving candidates (or, if none survive, among ALL
-         candidates - border-touching is a strong signal but not treated
-         as an absolute veto, since a genuinely off-center/edge-framed
-         embryo should still be picked over nothing), choose the one with
-         the LARGEST area, breaking ties by proximity to the frame center.
+         candidates), choose the one with the LARGEST area, breaking ties
+         by proximity to the frame center.
       4. Draw ONLY that one contour (filled) onto the output mask - no
          union with any other contour.
-
-    Noise-speck bug (found while comparing SegmenterModelSkip against
-    production on 92442871_0393_134.8_HB_0.jpg): step 0 didn't originally
-    exist. Without it, if the raw mask contains ANY tiny spurious blob that
-    happens to not touch the border, step 2's "prefer border-safe
-    candidates" rule made that speck the entire `preferred` pool, so it won
-    unconditionally over the real embryo even when the real embryo was
-    5000x larger and only disqualified for grazing the frame edge by 1-2
-    pixels. Filtering by minimum area FIRST closes this.
-
-    `min_area_frac` default (0.1, i.e. 10%): this now matches everywhere
-    it's used in this repo (this function's own default, the
-    run_segmenter_inspect.py CLI default, and every --mode pipeline config
-    below) - a previous version of the run_segmenter_inspect.py CLI
-    default was inconsistently set to 0.01 despite its own help text
-    already claiming 0.1; that mismatch has been fixed.
 
     Returns (final_mask, selected_contour) where final_mask matches the
     input mask's shape/dtype convention (float, 0.0/1.0) and
@@ -411,11 +387,9 @@ def squarify_bbox(min_x, min_y, max_x, max_y, img_w, img_h):
     `max(width, height)`, centered on the original box's center, then
     shift it (without resizing) so it stays fully within the image bounds.
 
-    Fixes a real distortion bug in production (`preprocessing_images.py`
-    crops directly to the mask's often-non-square bounding box, then does
-    `Image.resize((224, 224))`, which does NOT preserve aspect ratio - see
-    root cause F in SEGMENTER_ACCURACY_ROADMAP.md). Cropping a SQUARE
-    region first means the final resize is uniform, with no distortion.
+    Cropping a SQUARE region first means the final resize to 224x224 is
+    uniform, with no distortion - fixes root cause F in
+    SEGMENTER_ACCURACY_ROADMAP.md.
     """
     box_w = max_x - min_x
     box_h = max_y - min_y
@@ -443,10 +417,8 @@ def filter_mask_by_circularity_union(mask, min_circularity=0.7):
     current behavior ("config A" below): keep every contour whose
     circularity exceeds `min_circularity` and draw the UNION of all of
     them (as opposed to `select_best_contour`'s single-best-candidate,
-    no-circularity approach). Duplicated here (not imported) for the same
-    reason `run_segmenter_inspect.py` duplicates rather than imports
-    `preprocessing_images.py` - see that file's module docstring
-    (top-level side effects + placeholder paths at import time).
+    no-circularity approach). Duplicated here rather than imported - see
+    this module's docstring.
     """
     cv2mask = (mask * 255).astype(np.uint8)
     contours, _ = cv2.findContours(cv2mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -1910,12 +1882,10 @@ def build_arg_parser():
                                    "(default: 2). Used by configs Bprime/B/C.")
     pipeline_grp.add_argument("--min-area-frac", type=float, default=0.1,
                               help="select_best_contour's noise-speck-rejection area floor, "
-                                   "as a fraction of the frame (default: 0.1, i.e. 10%%). "
-                                   "Used by configs Bprime/B/C. This now matches "
-                                   "select_best_contour()'s own default and the "
-                                   "run_segmenter_inspect.py CLI default everywhere (a "
-                                   "previous mismatch where that CLI default was 0.01 despite "
-                                   "its help text already claiming 0.1 has been fixed).")
+                                   "as a fraction of the frame (default: 0.1, i.e. 10%%, "
+                                   "matching select_best_contour()'s own default and "
+                                   "run_segmenter_inspect.py's CLI default). Used by configs "
+                                   "Bprime/B/C.")
     pipeline_grp.add_argument("--circularity-threshold", type=float, default=0.7,
                               help="Config A's circularity-union filter threshold, matching "
                                    "preprocessing_images.py's hardcoded value (default: 0.7).")

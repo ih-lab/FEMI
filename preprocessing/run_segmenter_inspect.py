@@ -17,30 +17,21 @@ SEGMENTER_ACCURACY_ROADMAP.md (root causes A/B) instead of reproducing the
 production bug: rather than unioning every contour whose *circularity*
 clears a threshold, it picks a single best-candidate contour using
 border-rejection + a plausible-size cap + centrality — no circularity
-check at all. Circularity was deliberately dropped as a criterion
-entirely (not just softened): many real embryos (hatching, multi-cell/
-blastomere stage) are not close to circular, so shape-based scoring is an
-unreliable filter, whereas "is this contour touching the image border /
-implausibly large" cheaply and reliably distinguishes a dish rim or light
-vignette from an embryo without assuming anything about embryo shape. See
-`select_best_contour()` in `eval_segmenter.py` and
+check at all. See `select_best_contour()` in `eval_segmenter.py` and
 SEGMENTER_ACCURACY_ROADMAP.md Option C item 1 for the reasoning.
 
-REFACTOR NOTE: the low-level pipeline primitives this tool depends on
-(`load_model`, `load_image`, `segment_image`, `calculate_circularity`,
+The low-level pipeline primitives this tool depends on (`load_model`,
+`load_image`, `segment_image`, `calculate_circularity`,
 `automatic_brightness_and_contrast`, `find_bounding_box`,
-`select_best_contour`, `squarify_bbox`) now live in `eval_segmenter.py`
-(imported below), not here — they're shared with that script's `--mode
-pipeline` benchmark, which runs these same primitives end-to-end across
-several named pipeline configurations (including this tool's exact
-recipe) to produce quantitative Dice/IoU/HD95/bbox-IoU/failure-rate
-comparisons. This tool itself is still duplicated from (not imported from)
-`preprocessing_images.py`'s circularity-union logic, for the reason
-documented in `eval_segmenter.py`'s `filter_mask_by_circularity_union()`:
-that script runs directory-listing/model-loading/`ProcessPoolExecutor` as
-top-level side effects at import time and uses placeholder paths, so it
-is not safely importable — production still uses the old circularity-
-union logic until that fix is ported over there too.
+`select_best_contour`, `squarify_bbox`) live in `eval_segmenter.py`
+(imported below) — they're shared with that script's `--mode pipeline`
+benchmark, which runs these same primitives end-to-end across several
+named pipeline configurations (including this tool's exact recipe) to
+produce quantitative Dice/IoU/HD95/bbox-IoU/failure-rate comparisons.
+This tool is still duplicated from (not imported from)
+`preprocessing_images.py`'s circularity-union logic (see
+`eval_segmenter.py`'s module docstring for why) — production still uses
+the old circularity-union logic until that fix is ported over there too.
 
 For each input image, this script saves 2 files to --output-dir:
   <stem>_4_bbox_overlay.png       the input image with the final crop box drawn in red
@@ -91,8 +82,7 @@ from eval_segmenter import (
     select_best_contour,
     squarify_bbox,
 )
-
-SUPPORTED_EXTS = (".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp")
+from train_segmenter import IMAGE_EXTS
 
 
 def to_bgr_uint8(img):
@@ -175,7 +165,7 @@ def collect_image_paths(images, input_dir):
     paths = list(images)
     if input_dir:
         for f in sorted(os.listdir(input_dir)):
-            if f.lower().endswith(SUPPORTED_EXTS):
+            if f.lower().endswith(IMAGE_EXTS):
                 paths.append(os.path.join(input_dir, f))
     return paths
 
@@ -203,10 +193,9 @@ def main():
                              "frame BEFORE applying the border/size preference logic (default: "
                              "0.1, i.e. 10%%). Without this, a tiny noise speck that happens to "
                              "not touch the border can beat a much larger, genuine detection "
-                             "that grazes the border by a couple pixels - see the 'Noise-speck "
-                             "bug' note in select_best_contour(). (Fixed from a previous "
-                             "mismatched default of 0.01 - select_best_contour()'s own default "
-                             "and this flag's help text already said 0.1.)")
+                             "that grazes the border by a couple pixels - see "
+                             "select_best_contour() and SEGMENTER_ACCURACY_ROADMAP.md Root "
+                             "cause B.")
     parser.add_argument("--background-area-flag-threshold", type=float, default=0.7,
                         help="Flag an image's 'possible_background_false_positive' diagnostic "
                              "if the final crop covers more than this fraction of the frame "
