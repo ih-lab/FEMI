@@ -29,7 +29,9 @@ Quantitative benchmarking for `EmbryoSegmenter/SegmenterModel.py` (and its
       inside the predicted box, centroid error, crop-area fraction) plus
       failure-mode/deployability rates (full-image fallback, border-touch,
       possible dish/vignette false positive, visible aspect-ratio
-      distortion) and per-image latency - see `run_pipeline_mode()` below.
+      distortion), per-image end-to-end latency (mean/std/p50/p95,
+      throughput), and model storage (parameter count, checkpoint file
+      size, in-memory RAM footprint) - see `run_pipeline_mode()` below.
 
 Both modes share the same low-level pipeline primitives, which now live
 ONLY in this file (moved from `run_segmenter_inspect.py`, which imports them
@@ -114,6 +116,12 @@ Outputs (written to --output-dir):
     pipeline_failure_rates.png      fallback/border-touch/bg-FP/distortion rates per config
     pipeline_per_image_dice_iou.png per-image Tier-2 Dice/IoU distributions (box plot)
     pipeline_dice_by_dataset.png    Tier-2 Dice per config, broken out by dataset source
+    pipeline_resources.csv          one row per config: timing (mean/std/p50/p95, throughput)
+                                    + storage (parameter count, checkpoint file size MB,
+                                    in-memory model footprint MB)
+    pipeline_resources.png          3-panel deployability figure: latency, throughput,
+                                    model storage (params + checkpoint + RAM)
+    pipeline_latency_box.png        per-image end-to-end latency distribution per config
 
 No new dependencies: only numpy/torch/opencv/pillow (already required by
 EmbryoSegmenter/requirements-segmenter.txt) plus matplotlib for plots (also
@@ -850,6 +858,13 @@ def aggregate_pipeline_rows(rows):
         vals = [bool(r[key]) for r in rows if r.get(key) is not None]
         return float(np.mean(vals)) if vals else float("nan")
 
+    latency_vals = [r["latency_ms"] for r in rows if r.get("latency_ms") is not None]
+    mean_latency = float(np.mean(latency_vals)) if latency_vals else float("nan")
+    std_latency = float(np.std(latency_vals, ddof=1)) if len(latency_vals) > 1 else 0.0
+    p50_latency = float(np.percentile(latency_vals, 50)) if latency_vals else float("nan")
+    p95_latency = float(np.percentile(latency_vals, 95)) if latency_vals else float("nan")
+    throughput_ips = (1000.0 / mean_latency) if latency_vals and mean_latency > 0 else float("nan")
+
     return {
         "n_images": len(rows),
         "tier1_dice": mean_of("tier1_dice"), "tier1_iou": mean_of("tier1_iou"),
@@ -863,8 +878,59 @@ def aggregate_pipeline_rows(rows):
         "pct_visible_distortion": rate_of("likely_visible_distortion"),
         "pct_full_image_fallback": rate_of("full_image_fallback_triggered"),
         "pct_brightness_fallback": rate_of("brightness_fallback_triggered"),
-        "mean_latency_ms": mean_of("latency_ms"),
+        "mean_latency_ms": mean_latency,
+        "std_latency_ms": std_latency,
+        "p50_latency_ms": p50_latency,
+        "p95_latency_ms": p95_latency,
+        "throughput_ips": throughput_ips,
     }
+
+
+def model_storage_stats(model, weights_path):
+    """
+    Storage/deployability numbers for a loaded checkpoint:
+      - n_params: trainable parameter count
+      - n_params_m: same, in millions (for plotting)
+      - weights_file_mb: on-disk .pt file size
+      - model_ram_mb: in-memory footprint of loaded parameters + buffers
+        (actual element sizes, not just n_params * 4)
+    """
+    n_params = sum(p.numel() for p in model.parameters())
+    ram_bytes = sum(p.numel() * p.element_size() for p in model.parameters())
+    ram_bytes += sum(b.numel() * b.element_size() for b in model.buffers())
+    weights_file_mb = os.path.getsize(weights_path) / (1024.0 ** 2)
+    return {
+        "weights_path": weights_path,
+        "n_params": n_params,
+        "n_params_m": n_params / 1e6,
+        "weights_file_mb": weights_file_mb,
+        "model_ram_mb": ram_bytes / (1024.0 ** 2),
+    }
+
+
+def build_pipeline_resource_rows(summary_all, prod_model, skip_model, prod_weights, skip_weights):
+    """One deployability row per pipeline config (ALL-dataset summary only)."""
+    storage_prod = model_storage_stats(prod_model, prod_weights) if prod_model else None
+    storage_skip = model_storage_stats(skip_model, skip_weights) if skip_model else None
+    rows = []
+    for summary in summary_all:
+        config = summary["config"]
+        storage = storage_skip if config == "C" else storage_prod
+        rows.append({
+            "config": config,
+            "weights_path": storage["weights_path"],
+            "n_params": storage["n_params"],
+            "n_params_m": storage["n_params_m"],
+            "weights_file_mb": storage["weights_file_mb"],
+            "model_ram_mb": storage["model_ram_mb"],
+            "mean_latency_ms": summary["mean_latency_ms"],
+            "std_latency_ms": summary.get("std_latency_ms"),
+            "p50_latency_ms": summary.get("p50_latency_ms"),
+            "p95_latency_ms": summary.get("p95_latency_ms"),
+            "throughput_ips": summary.get("throughput_ips"),
+            "n_images_timed": summary["n_images"],
+        })
+    return rows
 
 
 # ---------------------------------------------------------------------------
@@ -1294,6 +1360,148 @@ def plot_pipeline_by_dataset(summary_by_dataset, out_path, metric="tier2_dice", 
     print(f"Wrote per-dataset breakdown plot to {os.path.abspath(out_path)}")
 
 
+def plot_pipeline_resources(resource_rows, out_path):
+    """
+    3-panel deployability figure for pipeline configs:
+      1. End-to-end latency (mean +/- 1 std, ms/image, CPU)
+      2. Throughput (images/sec, derived from mean latency)
+      3. Model storage: parameter count (M), checkpoint file size (MB),
+         in-memory footprint (MB)
+    """
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print("WARNING: matplotlib not installed, skipping pipeline_resources.png.")
+        return
+
+    if not resource_rows:
+        return
+
+    configs = [r["config"] for r in resource_rows]
+    mean_lat = [r["mean_latency_ms"] for r in resource_rows]
+    std_lat = [r.get("std_latency_ms") or 0.0 for r in resource_rows]
+    throughput = [r["throughput_ips"] for r in resource_rows]
+    params_m = [r["n_params_m"] for r in resource_rows]
+    weights_mb = [r["weights_file_mb"] for r in resource_rows]
+    ram_mb = [r["model_ram_mb"] for r in resource_rows]
+
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4.5))
+    x = np.arange(len(configs))
+
+    ax = axes[0]
+    bars = ax.bar(x, mean_lat, yerr=std_lat, capsize=4, color="#4C72B0",
+                  edgecolor="white", linewidth=0.8)
+    for bar, val in zip(bars, mean_lat):
+        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.5,
+                f"{val:.1f}", ha="center", va="bottom", fontsize=9)
+    ax.set_xticks(x)
+    ax.set_xticklabels(configs)
+    ax.set_ylabel("latency (ms / image)")
+    ax.set_title("End-to-end pipeline latency\n(mean +/- std; CPU, batch size 1)")
+    ax.grid(axis="y", alpha=0.3)
+
+    ax = axes[1]
+    bars = ax.bar(x, throughput, color="#55A868", edgecolor="white", linewidth=0.8)
+    for bar, val in zip(bars, throughput):
+        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.05,
+                f"{val:.1f}", ha="center", va="bottom", fontsize=9)
+    ax.set_xticks(x)
+    ax.set_xticklabels(configs)
+    ax.set_ylabel("throughput (images / sec)")
+    ax.set_title("Derived throughput\n(1000 / mean latency ms)")
+    ax.grid(axis="y", alpha=0.3)
+
+    ax = axes[2]
+    width = 0.25
+    b1 = ax.bar(x - width, params_m, width, label="params (M)", color="#8172B2",
+               edgecolor="white", linewidth=0.6)
+    b2 = ax.bar(x, weights_mb, width, label="checkpoint (MB)", color="#CCB974",
+               edgecolor="white", linewidth=0.6)
+    b3 = ax.bar(x + width, ram_mb, width, label="RAM loaded (MB)", color="#C44E52",
+               edgecolor="white", linewidth=0.6)
+    for bars, vals in ((b1, params_m), (b2, weights_mb), (b3, ram_mb)):
+        for bar, val in zip(bars, vals):
+            ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.05,
+                    f"{val:.2f}", ha="center", va="bottom", fontsize=7, rotation=0)
+    ax.set_xticks(x)
+    ax.set_xticklabels(configs)
+    ax.set_ylabel("size")
+    ax.set_title("Model storage / memory footprint")
+    ax.legend(fontsize=7, loc="upper left")
+    ax.grid(axis="y", alpha=0.3)
+
+    fig.suptitle("Pipeline deployability: time + storage (all datasets combined)",
+                 fontsize=11, y=1.02)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=120, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Wrote pipeline time/storage plot to {os.path.abspath(out_path)}")
+
+
+def plot_pipeline_latency_box(per_image_rows, out_path):
+    """Per-image end-to-end latency distribution per pipeline config (box plot)."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print("WARNING: matplotlib not installed, skipping pipeline_latency_box.png.")
+        return
+
+    configs = sorted({r["config"] for r in per_image_rows})
+    if not configs:
+        return
+
+    fig, ax = plt.subplots(figsize=(max(7, 2.2 * len(configs)), 5))
+    data, positions = [], []
+    rng = np.random.default_rng(42)
+    for i, cfg in enumerate(configs):
+        vals = [r["latency_ms"] for r in per_image_rows if r["config"] == cfg]
+        if not vals:
+            continue
+        data.append(vals)
+        positions.append(i)
+        jitter = rng.uniform(-0.12, 0.12, size=len(vals))
+        ax.scatter(np.full(len(vals), i) + jitter, vals, s=14, alpha=0.45,
+                   color="#333333", zorder=3, edgecolors="none")
+
+    if data:
+        bp = ax.boxplot(data, positions=positions, widths=0.45, patch_artist=True,
+                        showfliers=False, medianprops={"color": "black", "linewidth": 1.5})
+        for patch in bp["boxes"]:
+            patch.set_facecolor("#B8D4E8")
+            patch.set_alpha(0.85)
+
+    ax.set_xticks(range(len(configs)))
+    ax.set_xticklabels(configs)
+    ax.set_ylabel("latency (ms / image)")
+    ax.set_title("Per-image end-to-end pipeline latency (CPU, batch size 1)\n"
+                 "box = quartiles; dots = individual images")
+    ax.grid(axis="y", alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=120)
+    plt.close(fig)
+    print(f"Wrote per-image latency distribution plot to {os.path.abspath(out_path)}")
+
+
+def warmup_pipeline_models(prod_model, skip_model, img_arr, args, n_warmup):
+    """Run a few untimed iterations so latency measurements aren't dominated
+    by one-time CPU cache / PyTorch thread-pool warmup effects."""
+    if n_warmup <= 0:
+        return
+    if prod_model is not None:
+        for _ in range(n_warmup):
+            run_config_a(prod_model, img_arr, min_circularity=args.circularity_threshold)
+            run_config_new_pipeline(prod_model, img_arr, "squarify", args.max_area_frac,
+                                    args.border_margin, args.min_area_frac)
+    if skip_model is not None:
+        for _ in range(n_warmup):
+            run_config_new_pipeline(skip_model, img_arr, "squarify", args.max_area_frac,
+                                    args.border_margin, args.min_area_frac)
+
+
 # ---------------------------------------------------------------------------
 # --mode model
 # ---------------------------------------------------------------------------
@@ -1504,6 +1712,14 @@ def run_pipeline_mode(args):
         print(f"  {c}: {CONFIG_DESCRIPTIONS[c]}")
     print()
 
+    if args.timing_warmup > 0 and pairs:
+        _, _, warmup_path, _ = pairs[0]
+        warmup_img = load_image(warmup_path)
+        print(f"Timing warmup: {args.timing_warmup} untimed iteration(s) per loaded model "
+              f"on {os.path.basename(warmup_path)} ...")
+        warmup_pipeline_models(prod_model, skip_model, warmup_img, args, args.timing_warmup)
+        print()
+
     per_image_rows = []
     for dataset_name, stem, img_path, mask_path in pairs:
         img_arr = load_image(img_path)
@@ -1566,10 +1782,26 @@ def run_pipeline_mode(args):
         print(f"  [{r['config']}] n={r['n_images']}  Tier2 Dice={r['tier2_dice']:.4f}  "
               f"IoU={r['tier2_iou']:.4f}  HD95={r['tier2_hd95']:.2f}px  "
               f"BBoxIoU={r['bbox_iou']:.4f}  Recall={r['embryo_recall_in_bbox']:.4f}  "
-              f"latency={r['mean_latency_ms']:.2f}ms  "
+              f"latency={r['mean_latency_ms']:.2f}ms (p95={r['p95_latency_ms']:.2f})  "
+              f"throughput={r['throughput_ips']:.1f} img/s  "
               f"fallback={r['pct_full_image_fallback']:.2%}  border={r['pct_touches_border']:.2%}  "
               f"bg_fp={r['pct_background_false_positive']:.2%}  "
               f"distortion={r['pct_visible_distortion']:.2%}")
+
+    resource_rows = build_pipeline_resource_rows(
+        summary_all, prod_model, skip_model, args.prod_weights, args.skip_weights)
+    for row in resource_rows:
+        for k, v in row.items():
+            if isinstance(v, float):
+                row[k] = round(v, 4)
+    write_csv(os.path.join(args.output_dir, "pipeline_resources.csv"), resource_rows)
+
+    print("\n=== Pipeline deployability (time + storage) ===")
+    for r in resource_rows:
+        print(f"  [{r['config']}] params={r['n_params']:,}  "
+              f"checkpoint={r['weights_file_mb']:.2f} MB  RAM={r['model_ram_mb']:.2f} MB  "
+              f"latency mean={r['mean_latency_ms']:.2f}ms p50={r['p50_latency_ms']:.2f}ms "
+              f"p95={r['p95_latency_ms']:.2f}ms  throughput={r['throughput_ips']:.1f} img/s")
 
     plot_pipeline_dice_iou(summary_all, per_image_rows,
                            os.path.join(args.output_dir, "pipeline_dice_iou.png"))
@@ -1579,8 +1811,12 @@ def run_pipeline_mode(args):
                                 os.path.join(args.output_dir, "pipeline_per_image_dice_iou.png"))
     plot_pipeline_by_dataset(summary_by_dataset, os.path.join(args.output_dir, "pipeline_dice_by_dataset.png"),
                              metric="tier2_dice", title_metric="Dice")
+    plot_pipeline_resources(resource_rows, os.path.join(args.output_dir, "pipeline_resources.png"))
+    plot_pipeline_latency_box(per_image_rows, os.path.join(args.output_dir, "pipeline_latency_box.png"))
 
     print(f"\nDone. All outputs written to {os.path.abspath(args.output_dir)}.")
+    print("Deployability: see pipeline_resources.csv, pipeline_resources.png, "
+          "and pipeline_latency_box.png.")
     if "old_train" in dataset_names_used or "old_valid" in dataset_names_used:
         print("\nCAUTION: the 'old_train'/'old_valid' sources (mask/psd+Embryo, "
               "mask_valid/psd+Embryo) are the original paper's labeled dataset. If EITHER "
@@ -1687,6 +1923,10 @@ def build_arg_parser():
                               help="Flag a crop as 'possible_background_false_positive' if it "
                                    "covers more than this fraction of the frame (default: "
                                    "0.7). Matches run_segmenter_inspect.py's CLI default.")
+    pipeline_grp.add_argument("--timing-warmup", type=int, default=3,
+                              help="Untimed pipeline iterations per loaded model before "
+                                   "measuring latency (default: 3). Set to 0 to disable. "
+                                   "Reduces one-time CPU/PyTorch warmup bias in timing stats.")
 
     shared = parser.add_argument_group("shared options")
     shared.add_argument("--hd-percentile", type=float, default=95.0,
