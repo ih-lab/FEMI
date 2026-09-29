@@ -151,7 +151,9 @@ python run_segmenter_inspect.py path/to/image1.png path/to/image2.png
 python run_segmenter_inspect.py --input-dir path/to/raw_images --output-dir out/
 ```
 
-For each image, this saves the resized input, the raw model mask, the mask after best-candidate contour selection, a bounding-box overlay, and the final cropped output (both the production-faithful and aspect-ratio-corrected versions), plus prints diagnostics (fallback triggers, crop-area fraction, border-touching, possible background false positives) useful for auditing segmentation quality. See `SEGMENTER_ACCURACY_ROADMAP.md` for what these diagnostics mean and known failure modes.
+For each image, this saves the raw model mask (`_3_raw_mask.png`), a bounding-box overlay (`_4_bbox_overlay.png`), and the aspect-ratio-corrected 224x224 crop (`_6_cropped_224_fixed.png`), plus prints diagnostics (fallback triggers, crop-area fraction, border-touching, possible background false positives) useful for auditing segmentation quality. See `SEGMENTER_ACCURACY_ROADMAP.md` for what these diagnostics mean and known failure modes.
+
+Images flagged for manual review have those three files copied into `<output-dir>/needs_review/`, along with a `needs_review.csv` listing each flagged image and why. By default only images where the full-image fallback triggered are flagged; use `--review-on` to also flag on other diagnostics (`background_fp`, `border`, `distortion`), e.g. `--review-on fallback background_fp`.
 
 #### Improving the segmenter with new/corrected labeled data
 

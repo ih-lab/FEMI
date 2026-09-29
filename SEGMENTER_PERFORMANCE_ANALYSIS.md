@@ -331,8 +331,9 @@ double pass — a large margin.
 
 ### 6.4 Memory and I/O (inspect tool only)
 
-`run_segmenter_inspect.py` writes 6 PNG artifacts per image for manual
-review. That extra disk I/O is **not** part of the production
+`run_segmenter_inspect.py` writes 3 PNG artifacts per image (raw mask,
+bbox overlay, fixed crop), and copies them again into `needs_review/`
+for images flagged for manual review. That extra disk I/O is **not** part of the production
 post-processing cost model and should not be counted when estimating
 batch-preprocessing throughput. Production `preprocessing_images.py`
 would only pay the `select_best_contour` + `squarify_bbox` CPU cost if

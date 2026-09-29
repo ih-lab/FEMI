@@ -16,9 +16,6 @@ Quantitative benchmarking for `EmbryoSegmenter/SegmenterModel.py` (and its
       implementations:
         A       production today (`preprocessing_images.py`): circularity>0.7
                 contour union, conditional brightness-retry, direct/"warp" crop.
-        Bprime  ablation: the new `select_best_contour` logic (no circularity,
-                always-brightness-first) with production's OLD warp crop -
-                isolates the contour-selection fix from the crop-squarify fix.
         B       the full new pipeline (`run_segmenter_inspect.py`) with the
                 CURRENT production weights: new contour logic + squarify crop.
         C       the full new pipeline with the NEW `SegmenterModelSkip`
@@ -85,13 +82,13 @@ Usage:
         --weights EmbryoSegmenter/weights/epoch_102_loss_0.098710.pt --weights-name production \\
         --weights EmbryoSegmenter/weights_skip/latest.pt --weights-name skip_connections
 
-    # --mode pipeline: benchmark all 4 configs (A, Bprime, B, C) across all 3
+    # --mode pipeline: benchmark all 3 configs (A, B, C) across all 3
     # default labeled sources:
     python eval_segmenter.py --mode pipeline
 
-    # --mode pipeline: only the 3 "real" configs the fixes are meant to compare
-    # (skip the Bprime ablation), on just the new_labels/ set:
-    python eval_segmenter.py --mode pipeline --configs A,B,C \\
+    # --mode pipeline: only production vs. the full new pipeline with the
+    # new model, on just the new_labels/ set:
+    python eval_segmenter.py --mode pipeline --configs A,C \\
         --images-dir new_labels/raw_images --masks-dir new_labels/masks \\
         --mask-suffix _mask --mask-ext .png
 
@@ -158,9 +155,6 @@ DEFAULT_PIPELINE_SOURCES = [
 CONFIG_DESCRIPTIONS = {
     "A": "production today (preprocessing_images.py): circularity>0.7 contour union, "
          "conditional brightness-retry, direct/warp crop; production weights",
-    "Bprime": "ablation: select_best_contour (no circularity, always-brightness-first) "
-              "+ OLD warp crop - isolates the contour fix from the crop-squarify fix; "
-              "production weights",
     "B": "new pipeline (run_segmenter_inspect.py), OLD model: select_best_contour "
          "+ always-brightness-first + squarify crop; production weights",
     "C": "new pipeline, NEW model: select_best_contour + always-brightness-first "
@@ -246,7 +240,7 @@ def calculate_circularity(contour):
     """Same formula as preprocessing_images.py: 4*pi*Area/Perimeter^2 (1.0
     for a perfect circle). Used as a hard filter by config A
     (`filter_mask_by_circularity_union`) and purely as a diagnostic for
-    configs B/B'/C (which no longer use it to select/reject contours)."""
+    configs B/C (which no longer use it to select/reject contours)."""
     area = cv2.contourArea(contour)
     perimeter = cv2.arcLength(contour, True)
     if perimeter == 0:
@@ -467,26 +461,19 @@ def run_config_a(model, img, min_circularity=0.7):
     }
 
 
-def run_config_new_pipeline(model, img, crop_style, max_area_frac=0.9, border_margin=2,
+def run_config_new_pipeline(model, img, max_area_frac=0.9, border_margin=2,
                              min_area_frac=0.1):
     """
     The "Phase 1" pipeline from run_segmenter_inspect.py, parameterized by
-    `model` (production or SegmenterModelSkip weights) and `crop_style`
-    ("warp" or "squarify") to cover configs B', B, and C with one function:
-      Bprime = run_config_new_pipeline(prod_model, img, "warp", ...)
-      B      = run_config_new_pipeline(prod_model, img, "squarify", ...)
-      C      = run_config_new_pipeline(skip_model, img, "squarify", ...)
+    `model` to cover configs B and C with one function:
+      B = run_config_new_pipeline(prod_model, img, ...)
+      C = run_config_new_pipeline(skip_model, img, ...)
 
     ALWAYS brightness-corrects first (unlike config A's conditional
     retry - there is only ever one forward pass here), then picks a
-    single best contour via `select_best_contour` (no circularity check).
-    `crop_style` affects ONLY how `compute_crop_diagnostics` reports
-    distortion below - it does not change mask/bbox selection itself,
-    since squarify_bbox() is a post-hoc padding step applied to whatever
-    bbox `find_bounding_box` returns either way. This makes B/Bprime
-    directly comparable on mask/bbox metrics (isolating the crop-style
-    effect to just the distortion diagnostic), while B/C differ on
-    everything (different weights).
+    single best contour via `select_best_contour` (no circularity check),
+    and uses the "squarify" crop style (see squarify_bbox()). B and C
+    differ only in the weights.
     """
     bright_img = automatic_brightness_and_contrast(img)
     raw_mask = segment_image(model, bright_img)
@@ -499,7 +486,7 @@ def run_config_new_pipeline(model, img, crop_style, max_area_frac=0.9, border_ma
     bbox = find_bounding_box(filtered_mask)
     return {
         "raw_mask": raw_mask, "filtered_mask": filtered_mask, "bbox": bbox,
-        "crop_style": crop_style,
+        "crop_style": "squarify",
         "brightness_fallback_triggered": None,  # N/A - always brightness-corrected, no retry concept
         "full_image_fallback_triggered": full_image_fallback,
     }
@@ -1401,7 +1388,10 @@ def plot_pipeline_resources(resource_rows, out_path):
     ax.set_xticklabels(configs)
     ax.set_ylabel("size")
     ax.set_title("Model storage / memory footprint")
-    ax.legend(fontsize=7, loc="upper left")
+    # Headroom above the tallest bar + a single-row legend, so the legend
+    # sits above the value labels instead of covering them.
+    ax.set_ylim(0, max(max(params_m), max(weights_mb), max(ram_mb)) * 1.3)
+    ax.legend(fontsize=7, loc="upper center", ncol=3, frameon=False)
     ax.grid(axis="y", alpha=0.3)
 
     fig.suptitle("Pipeline deployability: time + storage (all datasets combined)",
@@ -1466,11 +1456,11 @@ def warmup_pipeline_models(prod_model, skip_model, img_arr, args, n_warmup):
     if prod_model is not None:
         for _ in range(n_warmup):
             run_config_a(prod_model, img_arr, min_circularity=args.circularity_threshold)
-            run_config_new_pipeline(prod_model, img_arr, "squarify", args.max_area_frac,
+            run_config_new_pipeline(prod_model, img_arr, args.max_area_frac,
                                     args.border_margin, args.min_area_frac)
     if skip_model is not None:
         for _ in range(n_warmup):
-            run_config_new_pipeline(skip_model, img_arr, "squarify", args.max_area_frac,
+            run_config_new_pipeline(skip_model, img_arr, args.max_area_frac,
                                     args.border_margin, args.min_area_frac)
 
 
@@ -1654,14 +1644,14 @@ def run_pipeline_mode(args):
     print(f"Total labeled pairs across all sources: {len(pairs)}\n")
 
     configs_to_run = [c.strip() for c in args.configs.split(",") if c.strip()]
-    valid_configs = {"A", "Bprime", "B", "C"}
+    valid_configs = {"A", "B", "C"}
     unknown = set(configs_to_run) - valid_configs
     if unknown:
         print(f"ERROR: unknown --configs entries {sorted(unknown)}; choices are "
               f"{sorted(valid_configs)}.", file=sys.stderr)
         sys.exit(1)
 
-    needs_prod = any(c in ("A", "Bprime", "B") for c in configs_to_run)
+    needs_prod = any(c in ("A", "B") for c in configs_to_run)
     needs_skip = "C" in configs_to_run
 
     prod_model = skip_model = None
@@ -1703,14 +1693,8 @@ def run_pipeline_mode(args):
             t0 = time.perf_counter()
             if config == "A":
                 result = run_config_a(model, img_arr, min_circularity=args.circularity_threshold)
-            elif config == "Bprime":
-                result = run_config_new_pipeline(model, img_arr, "warp", args.max_area_frac,
-                                                  args.border_margin, args.min_area_frac)
-            elif config == "B":
-                result = run_config_new_pipeline(model, img_arr, "squarify", args.max_area_frac,
-                                                  args.border_margin, args.min_area_frac)
-            else:  # "C"
-                result = run_config_new_pipeline(model, img_arr, "squarify", args.max_area_frac,
+            else:  # "B" or "C" - same pipeline, different weights
+                result = run_config_new_pipeline(model, img_arr, args.max_area_frac,
                                                   args.border_margin, args.min_area_frac)
             latency_ms = (time.perf_counter() - t0) * 1000.0
 
@@ -1810,7 +1794,7 @@ def build_arg_parser():
                     "quality (Dice/IoU/HD95/threshold-sweep/calibration) for one or more "
                     "checkpoints. --mode pipeline: full end-to-end preprocessing-pipeline "
                     "comparison (model + contour-selection + crop) across named configs "
-                    "A/Bprime/B/C - see module docstring.")
+                    "A/B/C - see module docstring.")
     parser.add_argument("--mode", choices=["model", "pipeline"], default="model",
                         help="'model' (default) or 'pipeline' - see module docstring for what "
                              "each evaluates.")
@@ -1863,29 +1847,28 @@ def build_arg_parser():
     pipeline_grp = parser.add_argument_group("--mode pipeline options")
     pipeline_grp.add_argument("--prod-weights", default=DEFAULT_WEIGHTS,
                               help="Production (non-skip-connection) checkpoint, used by "
-                                   f"configs A/Bprime/B (default: {DEFAULT_WEIGHTS}).")
+                                   f"configs A/B (default: {DEFAULT_WEIGHTS}).")
     pipeline_grp.add_argument("--skip-weights", default=DEFAULT_SKIP_WEIGHTS,
                               help="SegmenterModelSkip checkpoint, used by config C "
                                    f"(default: {DEFAULT_SKIP_WEIGHTS}).")
-    pipeline_grp.add_argument("--configs", default="A,Bprime,B,C",
+    pipeline_grp.add_argument("--configs", default="A,B,C",
                               help="Comma-separated subset of pipeline configs to run "
-                                   "(default: all four - A,Bprime,B,C). A=production today; "
-                                   "Bprime=new contour logic + old warp crop (ablation); "
+                                   "(default: all three - A,B,C). A=production today; "
                                    "B=new pipeline, old model; C=new pipeline, new model. "
                                    "See module docstring for full descriptions.")
     pipeline_grp.add_argument("--max-area-frac", type=float, default=0.9,
                               help="select_best_contour's implausibly-large-contour reject "
                                    "threshold, as a fraction of the frame (default: 0.9). "
-                                   "Used by configs Bprime/B/C.")
+                                   "Used by configs B/C.")
     pipeline_grp.add_argument("--border-margin", type=int, default=2,
                               help="select_best_contour's border-touch pixel margin "
-                                   "(default: 2). Used by configs Bprime/B/C.")
+                                   "(default: 2). Used by configs B/C.")
     pipeline_grp.add_argument("--min-area-frac", type=float, default=0.1,
                               help="select_best_contour's noise-speck-rejection area floor, "
                                    "as a fraction of the frame (default: 0.1, i.e. 10%%, "
                                    "matching select_best_contour()'s own default and "
                                    "run_segmenter_inspect.py's CLI default). Used by configs "
-                                   "Bprime/B/C.")
+                                   "B/C.")
     pipeline_grp.add_argument("--circularity-threshold", type=float, default=0.7,
                               help="Config A's circularity-union filter threshold, matching "
                                    "preprocessing_images.py's hardcoded value (default: 0.7).")
