@@ -28,10 +28,9 @@ The low-level pipeline primitives this tool depends on (`load_model`,
 benchmark, which runs these same primitives end-to-end across several
 named pipeline configurations (including this tool's exact recipe) to
 produce quantitative Dice/IoU/HD95/bbox-IoU/failure-rate comparisons.
-This tool is still duplicated from (not imported from)
-`preprocessing_images.py`'s circularity-union logic (see
-`eval_segmenter.py`'s module docstring for why) — production still uses
-the old circularity-union logic until that fix is ported over there too.
+`preprocessing_images.py` runs the same Phase 1 pipeline at batch scale,
+with its own copies of these helpers so that script stays independent of
+this benchmark.
 
 For each input image, this script saves 4 files to --output-dir:
   <stem>_2_brightness_adjusted.png the input after `automatic_brightness_and_contrast()`,

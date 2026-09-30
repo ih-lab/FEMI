@@ -1,9 +1,9 @@
 # --------------------------------------------------------------------------
 # preprocessing_images.py
 #
-# Standalone script that preprocesses a directory of raw embryo time-lapse
-# images before they are used to pretrain/fine-tune FEMI. For each image,
-# this script:
+# This is the main script that preprocesses a directory of raw embryo time-lapse
+# images before they are used to pretrain/fine-tune FEMI.
+# Originally, for each image, this script would:
 #   1. Loads and resizes the image to 224x224.
 #   2. Runs it through a small PyTorch segmentation model (SegmenterModel)
 #      to predict a mask of "which pixels belong to the embryo".
@@ -14,6 +14,17 @@
 #      automatically correcting brightness/contrast.
 #   5. Crops the image to the bounding box of the cleaned mask and resizes
 #      back to 224x224, then saves it to the output directory.
+#
+# Now this script makes the following changes:
+#   2. Applies automatic brightness/contrast correction (always, before
+#      segmentation — one forward pass per image).
+#   4. Picks a single best contour via border/size rejection + area/centrality
+#      scoring (`select_best_contour`) instead of unioning every sufficiently
+#      circular contour.
+#   5. If no valid contour is found, falls back to using the whole image.
+#   6. Squares up the bounding box (`squarify_bbox`), crops, and uniformly
+#      resizes to 224x224 (no aspect-ratio warping), then saves to the output
+#      directory.
 #
 # Images are processed in parallel across CPU cores using
 # `concurrent.futures.ProcessPoolExecutor` for speed, since each image is
@@ -137,28 +148,97 @@ def find_bounding_box(mask):
     
     return (min_x, min_y, max_x, max_y)
 
-def calculate_circularity(contour):
+def squarify_bbox(min_x, min_y, max_x, max_y, img_w, img_h):
     """
-    Compute how close a contour's shape is to a perfect circle using the
-    isoperimetric-style formula: circularity = 4*pi*Area / Perimeter^2.
-    A perfect circle scores 1.0; more irregular/elongated shapes score
-    lower. Used to filter out non-embryo blobs (e.g. dish artifacts) from
-    the predicted mask, since embryos are roughly circular/spherical.
+    Expand a (possibly non-square) bounding box into a square box of side
+    max(width, height), centered on the original box, then shift it so it
+    stays inside the image. Cropping a square first makes the later resize
+    to 224x224 uniform, so the embryo is not stretched.
     """
-    area = cv2.contourArea(contour)
-    perimeter = cv2.arcLength(contour, True)
-    if perimeter == 0:
-        return 0
-    return 4 * np.pi * (area / (perimeter ** 2))
+    box_w = max_x - min_x
+    box_h = max_y - min_y
+    side = max(box_w, box_h)
+    side = min(side, img_w, img_h)
+
+    cx = (min_x + max_x) / 2.0
+    cy = (min_y + max_y) / 2.0
+
+    new_min_x = int(round(cx - side / 2.0))
+    new_min_y = int(round(cy - side / 2.0))
+
+    new_min_x = max(0, min(new_min_x, img_w - side))
+    new_min_y = max(0, min(new_min_y, img_h - side))
+
+    new_max_x = new_min_x + side
+    new_max_y = new_min_y + side
+    return int(new_min_x), int(new_min_y), int(new_max_x), int(new_max_y)
+
+def select_best_contour(mask, max_area_frac=0.9, border_margin=2, min_area_frac=0.1):
+    """
+    Pick a single best-candidate contour instead of unioning every contour
+    whose circularity clears a threshold.
+
+    Discards specks smaller than `min_area_frac` of the frame, prefers
+    contours that do not touch the border and are not larger than
+    `max_area_frac` of the frame, and if none pass those checks falls back
+    to the full candidate pool. The largest remaining contour wins, with
+    ties broken by proximity to the frame center.
+
+    Returns (final_mask, selected_contour). final_mask is float 0.0/1.0.
+    selected_contour is None if no contour was found.
+    """
+    cv2mask = (mask * 255).astype(np.uint8)
+    h, w = cv2mask.shape[:2]
+    contours, _ = cv2.findContours(cv2mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    final_mask = np.zeros_like(cv2mask)
+
+    frame_area = float(w * h)
+    frame_cx, frame_cy = w / 2.0, h / 2.0
+
+    all_candidates = [cnt for cnt in contours if cv2.contourArea(cnt) > 0]
+    if not all_candidates:
+        return (final_mask / 255.0).astype(float), None
+
+    min_area = min_area_frac * frame_area
+    candidates = [cnt for cnt in all_candidates if cv2.contourArea(cnt) >= min_area]
+    if not candidates:
+        candidates = all_candidates
+
+    def touches_border(cnt):
+        x, y, bw, bh = cv2.boundingRect(cnt)
+        return (x <= border_margin or y <= border_margin
+                or (x + bw) >= (w - border_margin) or (y + bh) >= (h - border_margin))
+
+    def centroid(cnt):
+        m = cv2.moments(cnt)
+        if m["m00"] == 0:
+            x, y, bw, bh = cv2.boundingRect(cnt)
+            return x + bw / 2.0, y + bh / 2.0
+        return m["m10"] / m["m00"], m["m01"] / m["m00"]
+
+    preferred = [
+        cnt for cnt in candidates
+        if not touches_border(cnt) and cv2.contourArea(cnt) <= max_area_frac * frame_area
+    ]
+    pool = preferred if preferred else candidates
+
+    def score(cnt):
+        area = cv2.contourArea(cnt)
+        ccx, ccy = centroid(cnt)
+        dist_from_center = np.hypot(ccx - frame_cx, ccy - frame_cy)
+        return (area, -dist_from_center)
+
+    best = max(pool, key=score)
+    cv2.drawContours(final_mask, [best], -1, (255,), thickness=cv2.FILLED)
+    return (final_mask / 255.0).astype(float), best
 
 def automatic_brightness_and_contrast(image, clip_hist_percent=10):
     """
     Automatically rescale an image's brightness/contrast by clipping a
     percentage of the darkest/lightest pixels (based on the cumulative
     grayscale histogram) and linearly stretching the remaining range to
-    fill [0, 255]. This is used as a fallback preprocessing step when the
-    segmentation model fails to find any embryo-like region on the raw
-    image (e.g. because the frame is too dark/washed out).
+    fill [0, 255]. Applied to every frame before segmentation, so dark or
+    washed-out images are corrected before the single forward pass.
     """
     if len(image.shape) == 2:
         gray = image
@@ -177,7 +257,7 @@ def automatic_brightness_and_contrast(image, clip_hist_percent=10):
     
     # Locate points to clip
     maximum = accumulator[-1]
-    clip_hist_percent *= (maximum/100.0)
+    clip_hist_percent *= (maximum / 100.0)
     clip_hist_percent /= 2.0
     
     # Locate left cut
@@ -223,7 +303,6 @@ total_images = len(images)
 print("Total images:", total_images)
 
 
-# Make a parallelized version of the above code
 def process_image(image):
     """
     Full per-image preprocessing pipeline, designed to be called once per
@@ -233,58 +312,27 @@ def process_image(image):
     Steps:
       1. Load + resize to 224x224.
       2. Skip fully-blank images (np.max(img) == 0).
-      3. Segment -> binarize -> keep only sufficiently circular contours.
-      4. If that produced an empty mask, auto-correct brightness/contrast
-         and retry the segmentation + circularity filtering once.
-      5. If it's STILL empty after the retry, fall back to using the whole
-         image (no crop) rather than producing an unusable empty crop.
-      6. Crop to the final mask's bounding box, resize back to 224x224, and
-         save to `cropped_images_dir`.
+      3. Always brightness-correct, then segment once.
+      4. select_best_contour (single best candidate; no circularity filter).
+      5. If no valid contour, fall back to the full frame.
+      6. Squarify the bounding box, crop, uniformly resize to 224x224, save.
 
-    Complexity: every step here operates on a fixed 224x224-sized image, so
-    the per-image cost is O(1) (constant), aside from the initial file
-    decode which scales with the ORIGINAL image's resolution. In the worst
-    case (segmentation fails twice), the constant-factor cost roughly
-    doubles because segment_image() and the contour/circularity pipeline
-    run twice.
+    Complexity: every step operates on a fixed 224x224 image, so per-image
+    cost is O(1) aside from the initial file decode.
     """
     img = load_image(images_dir+image)
     if np.max(img) > 0:
-        # Segment the image
-        segmented_images, mask = segment_image(img)
-        cv2mask = (mask * 255).astype(np.uint8)
-        contours, _ = cv2.findContours(cv2mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        # Filter the contours based on circularity
-        min_circularity = 0.7  # This is a threshold for circularity
-        circular_contours = [cnt for cnt in contours if calculate_circularity(cnt) > min_circularity]
-        # Create an empty mask for the final output
-        final_mask = np.zeros_like(cv2mask)
-        cv2.drawContours(final_mask, circular_contours, -1, (255), thickness=cv2.FILLED)
-        final_mask = final_mask / 255.0
-        final_mask = final_mask.astype(float)
+        # Always correct brightness/contrast before the single forward pass.
+        bright_img = automatic_brightness_and_contrast(img)
+        segmented_images, mask = segment_image(bright_img)
+        final_mask, _selected_contour = select_best_contour(mask)
         if np.max(final_mask) == 0:
-            # First-pass segmentation found nothing sufficiently circular.
-            # Retry once after normalizing brightness/contrast, which often
-            # rescues frames that were too dark/washed out for the model.
-            bright_img = automatic_brightness_and_contrast(img)
-            segmented_images, mask = segment_image(bright_img)
-            cv2mask = (mask * 255).astype(np.uint8)
-            contours, _ = cv2.findContours(cv2mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            # Filter the contours based on circularity
-            min_circularity = 0.7
-            circular_contours = [cnt for cnt in contours if calculate_circularity(cnt) > min_circularity]
-            # Create an empty mask for the final output
-            final_mask = np.zeros_like(cv2mask)
-            cv2.drawContours(final_mask, circular_contours, -1, (255), thickness=cv2.FILLED)
-            final_mask = final_mask / 255.0
-            final_mask = final_mask.astype(float)
-            if np.sum(final_mask) == 0:
-                # Still nothing found even after the brightness retry: give
-                # up on cropping and just keep the full frame so the image
-                # isn't discarded entirely.
-                final_mask = np.ones_like(final_mask)
+            # No valid contour: keep the full frame so the image isn't discarded.
+            final_mask = np.ones_like(final_mask)
         min_x, min_y, max_x, max_y = find_bounding_box(final_mask)
-        cropped_image = img[min_y:max_y, min_x:max_x]    
+        h, w = img.shape[0], img.shape[1]
+        min_x, min_y, max_x, max_y = squarify_bbox(min_x, min_y, max_x, max_y, w, h)
+        cropped_image = img[min_y:max_y, min_x:max_x]
         cropped_image = Image.fromarray(cropped_image)
         cropped_image = cropped_image.resize((224, 224))
         cropped_image.save(cropped_images_dir+image)

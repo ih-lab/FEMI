@@ -14,9 +14,10 @@ Quantitative benchmarking for `EmbryoSegmenter/SegmenterModel.py` (and its
       + contour-selection/fallback logic + final crop geometry - across
       named pipeline "configs" that mirror this repo's actual, divergent
       implementations:
-        A       production today (`preprocessing_images.py`): circularity>0.7
-                contour union, conditional brightness-retry, direct/"warp" crop.
-        B       the full new pipeline (`run_segmenter_inspect.py`) with the
+        A       the previous production pipeline (circularity>0.7 contour union,
+                conditional brightness-retry, direct/"warp" crop). Kept here
+                for comparison; `preprocessing_images.py` no longer runs it.
+        B       the pipeline now in `preprocessing_images.py`, with the
                 CURRENT production weights: new contour logic + squarify crop.
         C       the full new pipeline with the NEW `SegmenterModelSkip`
                 weights (`train_segmenter.py --skip-connections`).
@@ -30,16 +31,16 @@ Quantitative benchmarking for `EmbryoSegmenter/SegmenterModel.py` (and its
       throughput), and model storage (parameter count, checkpoint file
       size, in-memory RAM footprint) - see `run_pipeline_mode()` below.
 
-Both modes share the same low-level pipeline primitives, which now live
-ONLY in this file (moved from `run_segmenter_inspect.py`, which imports them
-back): `load_model`, `load_image`, `segment_image`, `calculate_circularity`,
+Both modes use low-level pipeline primitives defined in THIS file
+(`load_model`, `load_image`, `segment_image`, `calculate_circularity`,
 `automatic_brightness_and_contrast`, `find_bounding_box`,
-`select_best_contour`, `squarify_bbox`. Config A's circularity-union filter
-(`filter_mask_by_circularity_union`) is ALSO duplicated here from
-`preprocessing_images.py` rather than imported from it, since that file runs
-model-loading/directory-listing/`ProcessPoolExecutor` as top-level side
-effects at import time and uses placeholder paths - see that file's module
-docstring for detail.
+`select_best_contour`, `squarify_bbox`). `run_segmenter_inspect.py` imports
+them from here. `preprocessing_images.py` is a separate, self-contained
+batch script and keeps its own copies — it is not imported here, because
+that file loads a model, lists a directory, and starts a ProcessPoolExecutor
+at import time. Config A's circularity-union filter
+(`filter_mask_by_circularity_union`) is the previous production behavior,
+kept in this file for the benchmark only.
 
 Reuses this repo's existing conventions rather than reinventing them:
   - Pair discovery (--mode model): `discover_pairs()` from `train_segmenter.py`
@@ -162,10 +163,10 @@ DEFAULT_PIPELINE_SOURCES = [
 ]
 
 CONFIG_DESCRIPTIONS = {
-    "A": "production today (preprocessing_images.py): circularity>0.7 contour union, "
+    "A": "previous production pipeline: circularity>0.7 contour union, "
          "conditional brightness-retry, direct/warp crop; production weights",
-    "B": "new pipeline (run_segmenter_inspect.py), OLD model: select_best_contour "
-         "+ always-brightness-first + squarify crop; production weights",
+    "B": "preprocessing_images.py pipeline, production weights: "
+         "select_best_contour + always-brightness-first + squarify crop",
     "C": "new pipeline, NEW model: select_best_contour + always-brightness-first "
          "+ squarify crop; SegmenterModelSkip weights",
 }
@@ -246,10 +247,12 @@ def segment_image(model, frame):
 
 
 def calculate_circularity(contour):
-    """Same formula as preprocessing_images.py: 4*pi*Area/Perimeter^2 (1.0
-    for a perfect circle). Used as a hard filter by config A
-    (`filter_mask_by_circularity_union`) and purely as a diagnostic for
-    configs B/C (which no longer use it to select/reject contours)."""
+    """Isoperimetric-style formula: 4*pi*Area/Perimeter^2 (1.0 for a perfect
+    circle). Used as a hard filter by config A
+    (`filter_mask_by_circularity_union`) — the only place left that runs
+    config A's logic, now that `preprocessing_images.py` runs config B/C.
+    Also reported purely as a diagnostic in `run_segmenter_inspect.py`,
+    which does not use it to select/reject contours."""
     area = cv2.contourArea(contour)
     perimeter = cv2.arcLength(contour, True)
     if perimeter == 0:
@@ -415,13 +418,11 @@ def squarify_bbox(min_x, min_y, max_x, max_y, img_w, img_h):
 
 def filter_mask_by_circularity_union(mask, min_circularity=0.7):
     """
-    Faithful reimplementation of the contour-filtering logic in
-    `preprocessing_images.py`'s `process_image()` - production's ACTUAL
-    current behavior ("config A" below): keep every contour whose
-    circularity exceeds `min_circularity` and draw the UNION of all of
-    them (as opposed to `select_best_contour`'s single-best-candidate,
-    no-circularity approach). Duplicated here rather than imported - see
-    this module's docstring.
+    The previous production contour filter (config A): keep every contour
+    whose circularity exceeds `min_circularity` and draw the UNION of all
+    of them. `preprocessing_images.py` no longer does this — it uses
+    `select_best_contour` — so this stays here only so the benchmark can
+    still compare against that older behavior.
     """
     cv2mask = (mask * 255).astype(np.uint8)
     contours, _ = cv2.findContours(cv2mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -437,17 +438,16 @@ def filter_mask_by_circularity_union(mask, min_circularity=0.7):
 
 def run_config_a(model, img, min_circularity=0.7):
     """
-    Config A: faithful reproduction of preprocessing_images.py's
-    process_image() (production today). Segment the RAW image first; keep
-    the circularity-union filtered mask; if empty, retry ONCE on a
-    brightness/contrast-corrected copy; if STILL empty, fall back to the
-    full frame. `raw_mask` in the returned dict is whichever forward
-    pass's output actually ended up feeding the (possibly-empty) filtered
-    mask - i.e. the retry's output if a retry happened, else the first
-    pass's. Crop style is "warp": production crops directly to this
-    (possibly non-square) box and force-resizes to 224x224, which distorts
-    the embryo's shape whenever the box isn't square - see
-    `compute_crop_diagnostics`.
+    Config A: the previous preprocessing_images.py pipeline. Segment the
+    RAW image first; keep the circularity-union filtered mask; if empty,
+    retry ONCE on a brightness/contrast-corrected copy; if STILL empty,
+    fall back to the full frame. `raw_mask` in the returned dict is
+    whichever forward pass's output actually ended up feeding the
+    (possibly-empty) filtered mask - i.e. the retry's output if a retry
+    happened, else the first pass's. Crop style is "warp": this config
+    crops directly to the (possibly non-square) box and force-resizes to
+    224x224, which distorts the embryo's shape whenever the box isn't
+    square - see `compute_crop_diagnostics`.
     """
     raw_mask = segment_image(model, img)
     filtered_mask = filter_mask_by_circularity_union(raw_mask, min_circularity)
@@ -1862,8 +1862,9 @@ def build_arg_parser():
                                    f"(default: {DEFAULT_SKIP_WEIGHTS}).")
     pipeline_grp.add_argument("--configs", default="A,B,C",
                               help="Comma-separated subset of pipeline configs to run "
-                                   "(default: all three - A,B,C). A=production today; "
-                                   "B=new pipeline, old model; C=new pipeline, new model. "
+                                   "(default: all three - A,B,C). A=previous production pipeline; "
+                                   "B=preprocessing_images.py pipeline, production weights; "
+                                   "C=same pipeline, SegmenterModelSkip weights. "
                                    "See module docstring for full descriptions.")
     pipeline_grp.add_argument("--max-area-frac", type=float, default=0.9,
                               help="select_best_contour's implausibly-large-contour reject "
