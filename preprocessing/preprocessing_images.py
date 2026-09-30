@@ -16,8 +16,11 @@
 #      back to 224x224, then saves it to the output directory.
 #
 # Now this script makes the following changes:
-#   2. Applies automatic brightness/contrast correction (always, before
-#      segmentation — one forward pass per image).
+#   2. Segments with SegmenterModelSkip (a U-Net variant with skip
+#      connections, trained via train_segmenter.py --skip-connections;
+#      see EmbryoSegmenter/SegmenterModel.py) instead of the original
+#      SegmenterModel, and always applies automatic brightness/contrast
+#      correction first (one forward pass per image, no retry). 
 #   4. Picks a single best contour via border/size rejection + area/centrality
 #      scoring (`select_best_contour`) instead of unioning every sufficiently
 #      circular contour.
@@ -49,7 +52,7 @@ import numpy as np
 from PIL import Image
 import os
 import torch
-from EmbryoSegmenter.SegmenterModel import SegmenterModel
+from EmbryoSegmenter.SegmenterModel import SegmenterModelSkip
 import cv2
 import concurrent.futures
 import time
@@ -70,9 +73,9 @@ def load_image(image_path):
 # into eval() mode to disable dropout/batchnorm training behavior and
 # gradient tracking overhead is avoided later via .detach() calls.
 # ---------------------------------------------------------------------
-weights_dir = 'EmbryoSegmenter/weights/'
-weights_file = weights_dir+'epoch_102_loss_0.098710.pt'
-model_ft = SegmenterModel()
+weights_dir = 'EmbryoSegmenter/weights_skip/'
+weights_file = weights_dir+'latest.pt'
+model_ft = SegmenterModelSkip()
 model_ft.load_state_dict(torch.load(weights_file, map_location='cpu'))
 model_ft = model_ft.to("cpu")
 model_ft.eval()
@@ -95,7 +98,7 @@ def segment_image(frame):
       the model's sigmoid output at 0.5.
 
     Complexity: this performs exactly one forward pass through
-    SegmenterModel on a fixed 224x224x1 input, so its cost is O(1)
+    SegmenterModelSkip on a fixed 224x224x1 input, so its cost is O(1)
     (constant) regardless of the original image's resolution.
     """
     frame = frame/255.0
@@ -110,7 +113,7 @@ def segment_image(frame):
     batch = torch.tensor(select_frames)
     batch = batch.float()
     # Forward pass through the encoder/decoder network (see
-    # SegmenterModel.forward). No torch.no_grad() context is used here, but
+    # SegmenterModelSkip.forward). No torch.no_grad() context is used here, but
     # .detach() below strips gradients before converting to numpy, so no
     # gradients are actually retained/backpropagated.
     outputs = model_ft(batch)

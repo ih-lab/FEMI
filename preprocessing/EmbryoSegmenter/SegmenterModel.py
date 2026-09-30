@@ -156,3 +156,78 @@ class SegmenterModel(nn.Module):
         return x
 
 
+class SegmenterModelSkip(nn.Module):
+    """
+    U-Net variant of `SegmenterModel`: same encoder and the same
+    `BasicConv2d`/`BasicConv2dSigmoid` building blocks, but each decoder
+    stage concatenates the matching encoder stage's pre-pool feature map
+    (a "skip connection") before its conv, so boundary detail doesn't have
+    to be reconstructed from the 7x7x512 bottleneck alone.
+
+    Only 5 of ~72 weight tensors differ in shape from `SegmenterModel`: the
+    `conv.weight` of `deconv4`/`deconv3`/`deconv2`/`deconv1`/`decoded` (their
+    input channel count doubles from the concatenation). Everything else -
+    the whole encoder, `deconv5` (which consumes the bottleneck directly,
+    nothing to concatenate there), and even the BatchNorm parameters of
+    those 5 changed layers (their output channel count is unchanged) -
+    matches `SegmenterModel` exactly by name and shape.
+
+    Trained via `train_segmenter.py --skip-connections`; checkpoints live in
+    `EmbryoSegmenter/weights_skip/`. `preprocessing_images.py` uses this
+    model (loaded from `weights_skip/latest.pt`) instead of `SegmenterModel`.
+    `SegmenterModel` above is kept as-is for benchmarking (`eval_segmenter.py`
+    configs A/B) and is not removed.
+    """
+
+    def __init__(self):
+        super(SegmenterModelSkip, self).__init__()
+
+        #encoder - identical to SegmenterModel's
+        self.conv1 = BasicConv2d(1, 16, kernel_size=3)
+        self.conv2 = BasicConv2d(16, 32, kernel_size=3)
+        self.conv3 = BasicConv2d(32, 64, kernel_size=3)
+        self.conv4 = BasicConv2d(64, 128, kernel_size=3)
+        self.conv5 = BasicConv2d(128, 256, kernel_size=3)
+        self.conv6 = BasicConv2d(256, 512, kernel_size=3)
+
+        #decoder - each stage's input channel count doubles to make room
+        # for the concatenated skip connection from the matching encoder stage.
+        self.deconv5 = BasicConv2d(512, 256, kernel_size=3)
+        self.deconv4 = BasicConv2d(256 + 256, 128, kernel_size=3)
+        self.deconv3 = BasicConv2d(128 + 128, 64, kernel_size=3)
+        self.deconv2 = BasicConv2d(64 + 64, 32, kernel_size=3)
+        self.deconv1 = BasicConv2d(32 + 32, 16, kernel_size=3)
+        self.decoded = BasicConv2dSigmoid(16 + 16, 1, kernel_size=3)
+
+    def forward(self, x):
+        # ----------------------- Encoder (downsampling) -----------------------
+        # Keep each pre-pool feature map (c1..c5) around for the skip
+        # connections below - this is the only structural difference from
+        # SegmenterModel.forward(), which discards them.
+        c1 = self.conv1(x)
+        p1 = F.max_pool2d(c1, kernel_size=2, stride=2)
+        c2 = self.conv2(p1)
+        p2 = F.max_pool2d(c2, kernel_size=2, stride=2)
+        c3 = self.conv3(p2)
+        p3 = F.max_pool2d(c3, kernel_size=2, stride=2)
+        c4 = self.conv4(p3)
+        p4 = F.max_pool2d(c4, kernel_size=2, stride=2)
+        c5 = self.conv5(p4)
+        p5 = F.max_pool2d(c5, kernel_size=2, stride=2)
+        c6 = self.conv6(p5)  # 7x7x512 bottleneck
+
+        # ----------------------- Decoder (upsampling + skip connections) -----
+        x = self.deconv5(c6)  # no skip here - c6 IS the direct input already
+        x = F.interpolate(x, scale_factor=2)
+        x = self.deconv4(torch.cat([x, c5], dim=1))
+        x = F.interpolate(x, scale_factor=2)
+        x = self.deconv3(torch.cat([x, c4], dim=1))
+        x = F.interpolate(x, scale_factor=2)
+        x = self.deconv2(torch.cat([x, c3], dim=1))
+        x = F.interpolate(x, scale_factor=2)
+        x = self.deconv1(torch.cat([x, c2], dim=1))
+        x = F.interpolate(x, scale_factor=2)
+        x = self.decoded(torch.cat([x, c1], dim=1))
+        return x
+
+
