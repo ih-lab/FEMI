@@ -151,9 +151,9 @@ python run_segmenter_inspect.py path/to/image1.png path/to/image2.png
 python run_segmenter_inspect.py --input-dir path/to/raw_images --output-dir out/
 ```
 
-For each image, this saves the raw model mask (`_3_raw_mask.png`), a bounding-box overlay (`_4_bbox_overlay.png`), and the aspect-ratio-corrected 224x224 crop (`_6_cropped_224_fixed.png`), plus prints diagnostics (fallback triggers, crop-area fraction, border-touching, possible background false positives) useful for auditing segmentation quality. See `SEGMENTER_ACCURACY_ROADMAP.md` for what these diagnostics mean and known failure modes.
+For each image, this saves the brightness/contrast-adjusted input the model actually sees (`_2_brightness_adjusted.png`), the raw model mask (`_3_raw_mask.png`), a bounding-box overlay (`_4_bbox_overlay.png`), and the aspect-ratio-corrected 224x224 crop (`_6_cropped_224_fixed.png`), plus prints diagnostics (fallback triggers, crop-area fraction, border-touching, possible background false positives) useful for auditing segmentation quality. See `SEGMENTER_ACCURACY_ROADMAP.md` for what these diagnostics mean and known failure modes.
 
-Images flagged for manual review have those three files copied into `<output-dir>/needs_review/`, along with a `needs_review.csv` listing each flagged image and why. By default only images where the full-image fallback triggered are flagged; use `--review-on` to also flag on other diagnostics (`background_fp`, `border`, `distortion`), e.g. `--review-on fallback background_fp`.
+Images flagged for manual review have those four files copied into `<output-dir>/needs_review/`, along with a `needs_review.csv` listing each flagged image and why. By default only images where the full-image fallback triggered are flagged; use `--review-on` to also flag on other diagnostics (`background_fp`, `border`, `distortion`), e.g. `--review-on fallback background_fp`.
 
 #### Improving the segmenter with new/corrected labeled data
 
@@ -196,6 +196,10 @@ retrain it on corrected labels:
    If you only have a small number of new/corrected examples, also pass
    `--freeze-encoder` to fine-tune only the decoder and reduce overfitting
    risk.
+   Pass `--brightness-correct` to train on images after
+   `automatic_brightness_and_contrast()`, the same correction the new
+   inference pipeline (`run_segmenter_inspect.py`) applies before
+   segmenting, so training matches inference.
 5. **Compare against production before promoting** the new checkpoint —
    don't overwrite `EmbryoSegmenter/weights/` directly:
    ```bash
@@ -255,9 +259,17 @@ python train_segmenter.py \
   --mask-suffix "" --mask-suffix _mask \
   --mask-ext .jpg --mask-ext .png \
   --val-images-dir mask_valid/psd --val-masks-dir mask_valid/Embryo \
+  --val-images-dir new_valid/raw_images --val-masks-dir new_valid/mask_valid \
+  --val-mask-suffix "" --val-mask-suffix _mask \
+  --val-mask-ext .jpg --val-mask-ext .png \
   --freeze-encoder \
   --epochs 50 --output-dir EmbryoSegmenter/weights_finetuned
 ```
 
 Validation defaults to `--val-mask-suffix "" --val-mask-ext .jpg` when
-`--val-images-dir` is used (matching `mask_valid/`).
+`--val-images-dir` is used (matching `mask_valid/`). With more than one
+validation folder, pass one `--val-mask-suffix` / `--val-mask-ext` per
+`--val-images-dir`, in the same order, as above: `new_valid/` (13 pairs)
+uses the Labelme naming (`foo.jpg` + `foo_mask.png`). Any image that
+appears in both a training and a validation folder is automatically
+dropped from training, with a warning.

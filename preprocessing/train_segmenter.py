@@ -23,7 +23,17 @@ corrected masks directory LAST:
 Only run this on machines/environments where you're comfortable running
 model training (needs more compute than this directory's inference-only
 tools - see SEGMENTER_PERFORMANCE_ANALYSIS.md). No new dependencies beyond
-requirements-segmenter.txt (torch, numpy, pillow) - OpenCV not needed.
+requirements-segmenter.txt (torch, numpy, pillow) - OpenCV is only needed
+with --brightness-correct (below).
+
+Brightness/contrast correction (--brightness-correct): applies the same
+`automatic_brightness_and_contrast()` that the new inference pipeline
+(`run_segmenter_inspect.py`, eval_segmenter.py configs B/C) runs on every
+image before segmenting it, so the model is trained on the same kind of
+input it sees at inference. Off by default, so existing runs reproduce as
+before - but a checkpoint trained WITHOUT it is fed corrected images it
+never saw during training when used in the new pipeline. Applied to both
+train and val images (and --preview-only previews).
 
 Fidelity to the original method (Rajendran et al. 2025) and what this
 script does/doesn't reproduce: see SEGMENTER_ACCURACY_ROADMAP.md §3. In
@@ -87,6 +97,9 @@ Usage:
         --mask-suffix "" --mask-suffix _mask \\
         --mask-ext .jpg --mask-ext .png \\
         --val-images-dir mask_valid/psd --val-masks-dir mask_valid/Embryo \\
+        --val-images-dir new_valid/raw_images --val-masks-dir new_valid/mask_valid \\
+        --val-mask-suffix "" --val-mask-suffix _mask \\
+        --val-mask-ext .jpg --val-mask-ext .png \\
         --freeze-encoder \\
         --epochs 50 --output-dir EmbryoSegmenter/weights_finetuned
 
@@ -333,6 +346,11 @@ class SegmentationDataset(Dataset):
       - horizontal/vertical flip
       - 90-degree-multiple rotation only (no arbitrary-angle rotation,
         which would need interpolation and blur the mask's binary edges)
+    If `brightness_correct` is True, `automatic_brightness_and_contrast()`
+    is applied to the FULL original image right after loading, before any
+    augmentation - so, as at inference, the correction is always computed
+    from the whole frame's histogram, never from a random crop of it.
+
     Brightness/contrast jitter is applied to the image only, after
     resizing, since it should never affect the mask - the paper does not
     list this as a training-time augmentation (it describes brightness/
@@ -341,11 +359,13 @@ class SegmentationDataset(Dataset):
     treat this as an extra addition beyond what's described in the paper.
     """
 
-    def __init__(self, pairs, size=(224, 224), augment=False, crop_min_scale=0.85):
+    def __init__(self, pairs, size=(224, 224), augment=False, crop_min_scale=0.85,
+                 brightness_correct=False):
         self.pairs = pairs  # list of (image_path, mask_path)
         self.size = size
         self.augment = augment
         self.crop_min_scale = crop_min_scale
+        self.brightness_correct = brightness_correct
 
     def __len__(self):
         return len(self.pairs)
@@ -389,6 +409,12 @@ class SegmentationDataset(Dataset):
             # labelme_json_to_mask.py against this exact image, but resize
             # defensively rather than crash on a mismatched pair.
             mask = mask.resize(img.size, Image.NEAREST)
+
+        if self.brightness_correct:
+            # Imported here, not at module level: eval_segmenter imports
+            # from this module, so a top-level import would be circular.
+            from eval_segmenter import automatic_brightness_and_contrast
+            img = Image.fromarray(automatic_brightness_and_contrast(np.asarray(img)))
 
         if self.augment:
             img, mask = self._augment_pair(img, mask)
@@ -648,6 +674,11 @@ def main():
                         help="Freeze encoder layers (conv1-conv6), fine-tune only the decoder. "
                              "Recommended if you only have a handful of new corrected examples, "
                              "to reduce the risk of overfitting/forgetting on the encoder.")
+    parser.add_argument("--brightness-correct", action="store_true",
+                        help="Apply automatic_brightness_and_contrast() (the same correction "
+                             "the new inference pipeline applies before segmenting) to every "
+                             "train/val image before augmentation, so training matches "
+                             "inference. Off by default. Requires opencv.")
     parser.add_argument("--no-augment", action="store_true",
                         help="Disable train-time augmentation (flips/rotation/brightness jitter).")
     parser.add_argument("--no-plot", action="store_true",
@@ -733,7 +764,8 @@ def main():
               f"variance with a tiny val set).")
 
     if args.preview_only:
-        preview_dataset = SegmentationDataset(train_pairs + val_pairs, augment=False)
+        preview_dataset = SegmentationDataset(train_pairs + val_pairs, augment=False,
+                                              brightness_correct=args.brightness_correct)
         save_preview(preview_dataset, args.preview_dir, n=args.preview_n)
         return
 
@@ -741,8 +773,12 @@ def main():
     print(f"Using device: {device}")
 
     train_ds = SegmentationDataset(train_pairs, augment=not args.no_augment,
-                                    crop_min_scale=args.crop_min_scale)
-    val_ds = SegmentationDataset(val_pairs, augment=False)
+                                    crop_min_scale=args.crop_min_scale,
+                                    brightness_correct=args.brightness_correct)
+    val_ds = SegmentationDataset(val_pairs, augment=False,
+                                  brightness_correct=args.brightness_correct)
+    print(f"Brightness/contrast correction on train/val images: "
+          f"{'ON' if args.brightness_correct else 'OFF'}")
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
                                num_workers=args.num_workers)
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False,

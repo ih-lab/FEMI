@@ -57,7 +57,7 @@ Reuses this repo's existing conventions rather than reinventing them:
   - Dice/IoU formula: identical to `dice_iou_at_threshold()` in
     `train_segmenter.py` (same epsilon, same definition).
 
---mode pipeline data sources: by default, ALL THREE of this repo's labeled
+--mode pipeline data sources: by default, ALL FOUR of this repo's labeled
 sets, tagged by dataset in the output so you can check whether a config's
 ranking holds up consistently across sources (and so you can spot
 optimistic bias if a checkpoint was trained on one of them - see the
@@ -70,6 +70,13 @@ caution message printed at the end of a pipeline run):
   new_labels  preprocessing/new_labels/raw_images + preprocessing/new_labels/masks
               - this repo's newer Labelme-annotated set
               (labelme_json_to_mask.py convention: "foo.jpg" + "foo_mask.png").
+  new_valid   preprocessing/new_valid/raw_images + preprocessing/new_valid/mask_valid
+              - held-out validation set for new train_segmenter.py runs
+              (same naming as new_labels). Checkpoints trained with it as
+              --val-images-dir never saw it, so its per-dataset numbers are
+              the fairest comparison. Note one image
+              (42256795_0397_133.9_B_0) is also in old_train, so the
+              production weights have seen that one.
 
 Usage:
     cd preprocessing
@@ -82,7 +89,7 @@ Usage:
         --weights EmbryoSegmenter/weights/epoch_102_loss_0.098710.pt --weights-name production \\
         --weights EmbryoSegmenter/weights_skip/latest.pt --weights-name skip_connections
 
-    # --mode pipeline: benchmark all 3 configs (A, B, C) across all 3
+    # --mode pipeline: benchmark all 3 configs (A, B, C) across all 4
     # default labeled sources:
     python eval_segmenter.py --mode pipeline
 
@@ -150,6 +157,8 @@ DEFAULT_PIPELINE_SOURCES = [
     ("old_train", os.path.join(SCRIPT_DIR, "mask", "psd"), os.path.join(SCRIPT_DIR, "mask", "Embryo"), "", ".jpg"),
     ("old_valid", os.path.join(SCRIPT_DIR, "mask_valid", "psd"), os.path.join(SCRIPT_DIR, "mask_valid", "Embryo"), "", ".jpg"),
     ("new_labels", DEFAULT_IMAGES_DIR, DEFAULT_MASKS_DIR, "_mask", ".png"),
+    ("new_valid", os.path.join(SCRIPT_DIR, "new_valid", "raw_images"),
+     os.path.join(SCRIPT_DIR, "new_valid", "mask_valid"), "_mask", ".png"),
 ]
 
 CONFIG_DESCRIPTIONS = {
@@ -1633,8 +1642,8 @@ def run_pipeline_mode(args):
         sources = list(zip(dataset_names, args.images_dir, args.masks_dir, mask_suffixes, mask_exts))
     else:
         sources = DEFAULT_PIPELINE_SOURCES
-        print("No --images-dir given; using this repo's 3 default labeled sources "
-              "(old paper train + old paper val + new Labelme labels):")
+        print("No --images-dir given; using this repo's 4 default labeled sources "
+              "(old paper train + old paper val + new Labelme labels + new Labelme val):")
 
     print("Discovering labeled (image, mask) pairs across all dataset sources...")
     pairs = collect_labeled_pairs_with_dataset_tags(sources)
@@ -1802,7 +1811,7 @@ def build_arg_parser():
     data = parser.add_argument_group("data selection")
     data.add_argument("--images-dir", action="append", default=None,
                       help="Directory of raw images (repeatable). --mode model default: "
-                           f"{DEFAULT_IMAGES_DIR}. --mode pipeline default (if omitted): all 3 "
+                           f"{DEFAULT_IMAGES_DIR}. --mode pipeline default (if omitted): all 4 "
                            "of this repo's labeled sources combined (see module docstring).")
     data.add_argument("--masks-dir", action="append", default=None,
                       help="Directory of mask files matching --images-dir (repeatable). "

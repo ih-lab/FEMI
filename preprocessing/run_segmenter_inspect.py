@@ -33,7 +33,9 @@ This tool is still duplicated from (not imported from)
 `eval_segmenter.py`'s module docstring for why) — production still uses
 the old circularity-union logic until that fix is ported over there too.
 
-For each input image, this script saves 3 files to --output-dir:
+For each input image, this script saves 4 files to --output-dir:
+  <stem>_2_brightness_adjusted.png the input after `automatic_brightness_and_contrast()`,
+                                   i.e. exactly what the model sees
   <stem>_3_raw_mask.png           the model's raw binary mask (thresholded at 0.5), BEFORE
                                    contour selection - so for a full-image-fallback image
                                    it shows what the model actually predicted
@@ -62,7 +64,7 @@ instrumentation recommended in SEGMENTER_ACCURACY_ROADMAP.md:
     used to select or reject the contour
 
 Manual-review step: every image that trips one of the `--review-on`
-criteria (default: only the full-image fallback) has its 3 output files
+criteria (default: only the full-image fallback) has its 4 output files
 copied into <output-dir>/needs_review/, and one row per flagged image
 (with the reasons it was flagged) is written to
 <output-dir>/needs_review/needs_review.csv.
@@ -170,6 +172,9 @@ def process_one_image(model, img_path, output_dir, max_area_frac=0.9, border_mar
 
     os.makedirs(output_dir, exist_ok=True)
 
+    bright_path = os.path.join(output_dir, f"{stem}_2_brightness_adjusted.png")
+    cv2.imwrite(bright_path, to_bgr_uint8(bright_img))
+
     raw_mask_path = os.path.join(output_dir, f"{stem}_3_raw_mask.png")
     cv2.imwrite(raw_mask_path, (raw_mask * 255).astype(np.uint8))
 
@@ -182,7 +187,7 @@ def process_one_image(model, img_path, output_dir, max_area_frac=0.9, border_mar
     cropped_path = os.path.join(output_dir, f"{stem}_6_cropped_224_fixed.png")
     fixed_cropped_image.save(cropped_path)
 
-    diagnostics["output_files"] = [raw_mask_path, overlay_path, cropped_path]
+    diagnostics["output_files"] = [bright_path, raw_mask_path, overlay_path, cropped_path]
     return diagnostics
 
 
@@ -261,7 +266,7 @@ def main():
     parser.add_argument("--review-on", nargs="+", choices=sorted(REVIEW_CRITERIA),
                         default=["fallback"],
                         help="Which diagnostics flag an image for manual review; flagged "
-                             "images' mask/overlay/crop are copied into "
+                             "images' brightness-adjusted input/mask/overlay/crop are copied into "
                              "<output-dir>/needs_review/ alongside needs_review.csv "
                              "(default: fallback, i.e. full-image fallback only).")
     args = parser.parse_args()
