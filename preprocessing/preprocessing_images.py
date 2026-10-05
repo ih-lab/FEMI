@@ -2,7 +2,7 @@ import numpy as np
 from PIL import Image
 import os
 import torch
-from EmbryoSegmenter.SegmenterModel import SegmenterModel
+from EmbryoSegmenter.SegmenterModel import SegmenterModelSkip
 import cv2
 import concurrent.futures
 import time
@@ -13,9 +13,9 @@ def load_image(image_path):
     img = np.array(img)
     return img
 
-weights_dir = 'EmbryoSegmenter/weights/'
-weights_file = weights_dir+'epoch_102_loss_0.098710.pt'
-model_ft = SegmenterModel()
+weights_dir = 'EmbryoSegmenter/weights_skip/'
+weights_file = weights_dir+'latest.pt'
+model_ft = SegmenterModelSkip()
 model_ft.load_state_dict(torch.load(weights_file, map_location='cpu'))
 model_ft = model_ft.to("cpu")
 model_ft.eval()
@@ -54,6 +54,7 @@ def find_bounding_box(mask):
     """
     # Find the rows and columns where the mask is 1
     if np.sum(mask) == 0:
+        # No positive pixels at all: fall back to the full image bounds.
         return (0, 0, mask.shape[1], mask.shape[0])
     rows = np.any(mask, axis=1)
     cols = np.any(mask, axis=0)
@@ -64,12 +65,77 @@ def find_bounding_box(mask):
     
     return (min_x, min_y, max_x, max_y)
 
-def calculate_circularity(contour):
-    area = cv2.contourArea(contour)
-    perimeter = cv2.arcLength(contour, True)
-    if perimeter == 0:
-        return 0
-    return 4 * np.pi * (area / (perimeter ** 2))
+def squarify_bbox(min_x, min_y, max_x, max_y, img_w, img_h):
+    # Pads the box to a square before cropping, so the later resize to
+    # 224x224 doesn't stretch the embryo.
+    box_w = max_x - min_x
+    box_h = max_y - min_y
+    side = max(box_w, box_h)
+    side = min(side, img_w, img_h)
+
+    cx = (min_x + max_x) / 2.0
+    cy = (min_y + max_y) / 2.0
+
+    new_min_x = int(round(cx - side / 2.0))
+    new_min_y = int(round(cy - side / 2.0))
+
+    new_min_x = max(0, min(new_min_x, img_w - side))
+    new_min_y = max(0, min(new_min_y, img_h - side))
+
+    new_max_x = new_min_x + side
+    new_max_y = new_min_y + side
+    return int(new_min_x), int(new_min_y), int(new_max_x), int(new_max_y)
+
+def select_best_contour(mask, max_area_frac=0.9, border_margin=2, min_area_frac=0.1):
+    # Picks one best-candidate contour instead of unioning every contour
+    # above a circularity threshold. Border-touching/oversized contours
+    # (dish rim, vignette) are first discarded; largest remaining area wins,
+    # ties broken by proximity to frame center.
+    cv2mask = (mask * 255).astype(np.uint8)
+    h, w = cv2mask.shape[:2]
+    contours, _ = cv2.findContours(cv2mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    final_mask = np.zeros_like(cv2mask)
+
+    frame_area = float(w * h)
+    frame_cx, frame_cy = w / 2.0, h / 2.0
+
+    all_candidates = [cnt for cnt in contours if cv2.contourArea(cnt) > 0]
+    if not all_candidates:
+        return (final_mask / 255.0).astype(float), None
+
+    # Discard specks smaller than min_area_frac before anything else.
+    min_area = min_area_frac * frame_area
+    candidates = [cnt for cnt in all_candidates if cv2.contourArea(cnt) >= min_area]
+    if not candidates:
+        candidates = all_candidates
+
+    def touches_border(cnt):
+        x, y, bw, bh = cv2.boundingRect(cnt)
+        return (x <= border_margin or y <= border_margin
+                or (x + bw) >= (w - border_margin) or (y + bh) >= (h - border_margin))
+
+    def centroid(cnt):
+        m = cv2.moments(cnt)
+        if m["m00"] == 0:
+            x, y, bw, bh = cv2.boundingRect(cnt)
+            return x + bw / 2.0, y + bh / 2.0
+        return m["m10"] / m["m00"], m["m01"] / m["m00"]
+
+    preferred = [
+        cnt for cnt in candidates
+        if not touches_border(cnt) and cv2.contourArea(cnt) <= max_area_frac * frame_area
+    ]
+    pool = preferred if preferred else candidates
+
+    def score(cnt):
+        area = cv2.contourArea(cnt)
+        ccx, ccy = centroid(cnt)
+        dist_from_center = np.hypot(ccx - frame_cx, ccy - frame_cy)
+        return (area, -dist_from_center)
+
+    best = max(pool, key=score)
+    cv2.drawContours(final_mask, [best], -1, (255,), thickness=cv2.FILLED)
+    return (final_mask / 255.0).astype(float), best
 
 def automatic_brightness_and_contrast(image, clip_hist_percent=10):
     if len(image.shape) == 2:
@@ -131,35 +197,17 @@ print("Total images:", total_images)
 def process_image(image):
     img = load_image(images_dir+image)
     if np.max(img) > 0:
-        # Segment the image
-        segmented_images, mask = segment_image(img)
-        cv2mask = (mask * 255).astype(np.uint8)
-        contours, _ = cv2.findContours(cv2mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        # Filter the contours based on circularity
-        min_circularity = 0.7  # This is a threshold for circularity
-        circular_contours = [cnt for cnt in contours if calculate_circularity(cnt) > min_circularity]
-        # Create an empty mask for the final output
-        final_mask = np.zeros_like(cv2mask)
-        cv2.drawContours(final_mask, circular_contours, -1, (255), thickness=cv2.FILLED)
-        final_mask = final_mask / 255.0
-        final_mask = final_mask.astype(float)
+        # Always brightness-correct first, then segment once (no retry).
+        bright_img = automatic_brightness_and_contrast(img)
+        segmented_images, mask = segment_image(bright_img)
+        final_mask, _selected_contour = select_best_contour(mask)
         if np.max(final_mask) == 0:
-            bright_img = automatic_brightness_and_contrast(img)
-            segmented_images, mask = segment_image(bright_img)
-            cv2mask = (mask * 255).astype(np.uint8)
-            contours, _ = cv2.findContours(cv2mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            # Filter the contours based on circularity
-            min_circularity = 0.7
-            circular_contours = [cnt for cnt in contours if calculate_circularity(cnt) > min_circularity]
-            # Create an empty mask for the final output
-            final_mask = np.zeros_like(cv2mask)
-            cv2.drawContours(final_mask, circular_contours, -1, (255), thickness=cv2.FILLED)
-            final_mask = final_mask / 255.0
-            final_mask = final_mask.astype(float)
-            if np.sum(final_mask) == 0:
-                final_mask = np.ones_like(final_mask)
+            # No valid contour: keep the full frame so the image isn't discarded.
+            final_mask = np.ones_like(final_mask)
         min_x, min_y, max_x, max_y = find_bounding_box(final_mask)
-        cropped_image = img[min_y:max_y, min_x:max_x]    
+        h, w = img.shape[0], img.shape[1]
+        min_x, min_y, max_x, max_y = squarify_bbox(min_x, min_y, max_x, max_y, w, h)
+        cropped_image = img[min_y:max_y, min_x:max_x]
         cropped_image = Image.fromarray(cropped_image)
         cropped_image = cropped_image.resize((224, 224))
         cropped_image.save(cropped_images_dir+image)

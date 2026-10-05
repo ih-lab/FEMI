@@ -228,7 +228,7 @@ def main(args):
         
         model = TFViTMAEForPreTraining.from_pretrained(args.femi_model_path)
         num_hidden_layers = 24
-        model.config.mask_ratio = 0
+        model.config.mask_ratio = 0  # disable masking - encode the full image, don't reconstruct it
         model.config.hidden_dropout_prob = 0.2
             
         image_input = Input(shape=(224, 224, 3))
