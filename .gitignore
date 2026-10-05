@@ -11,3 +11,16 @@ __pycache__/
 
 # Ad-hoc inspection outputs
 segmenter_inspection_output/
+
+# images
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.bmp
+*.tiff
+*.ico
+*.webp
+*.svg
+*.eps
+*.pdf
