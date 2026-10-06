@@ -47,8 +47,8 @@ from PIL import Image
 from torch.utils.data import DataLoader, Dataset
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-DEFAULT_CROPS_DIR = SCRIPT_DIR / "segmenter_pipeline_eval_output" / "crops"
-DEFAULT_OUTPUT_DIR = SCRIPT_DIR / "segmenter_pipeline_eval_output" / "femi_embeddings"
+DEFAULT_CROPS_DIR = SCRIPT_DIR / "segmenter_crops_output" / "crops"
+DEFAULT_OUTPUT_DIR = SCRIPT_DIR / "segmenter_crops_output" / "femi_embeddings"
 DEFAULT_FEMI_CKPT = SCRIPT_DIR.parent / "torch_model_maskRatio075_18mill"
 IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp")
 
@@ -252,16 +252,22 @@ def _image_label(dataset: str, image: str, n_datasets: int) -> str:
 
 
 def plot_similarity_summary(pairs: pd.DataFrame, out_path: Path, plt) -> None:
-    """Bar = mean cosine per config pair (+/- std); dots = individual images."""
+    """Distribution of cosine similarity per config pair. Individual images
+    are drawn as dots only when there are few enough to read; otherwise a
+    box plot, since thousands of dots just paint over the bars."""
     order = list(dict.fromkeys(pairs["pair"]))
+    grouped = [pairs.loc[pairs["pair"] == pair, "cls_cosine"].to_numpy() for pair in order]
     fig, ax = plt.subplots(figsize=(max(5, 1.8 * len(order)), 4.5))
-    rng = np.random.default_rng(0)
-    for i, pair in enumerate(order):
-        vals = pairs.loc[pairs["pair"] == pair, "cls_cosine"].to_numpy()
-        ax.bar(i, vals.mean(), yerr=vals.std(), width=0.6, color="#9ecae1",
-               edgecolor="#3182bd", capsize=6, zorder=1)
-        ax.scatter(i + rng.uniform(-0.15, 0.15, len(vals)), vals, s=22,
-                   color="#08519c", zorder=2)
+    if max(len(v) for v in grouped) <= 80:
+        rng = np.random.default_rng(0)
+        for i, vals in enumerate(grouped):
+            ax.bar(i, vals.mean(), yerr=vals.std(), width=0.6, color="#9ecae1",
+                   edgecolor="#3182bd", capsize=6, zorder=1)
+            ax.scatter(i + rng.uniform(-0.15, 0.15, len(vals)), vals, s=22,
+                       color="#08519c", zorder=2)
+    else:
+        ax.boxplot(grouped, positions=range(len(order)), widths=0.55, showfliers=True,
+                   flierprops={"marker": "o", "markersize": 3, "alpha": 0.4})
     lo = pairs["cls_cosine"].min()
     ax.set_ylim(max(0.0, lo - 0.02), 1.002)
     ax.axhline(1.0, color="gray", lw=0.8, ls="--")
@@ -275,14 +281,23 @@ def plot_similarity_summary(pairs: pd.DataFrame, out_path: Path, plt) -> None:
     plt.close(fig)
 
 
+HEATMAP_MAX_ROWS = 40
+
+
 def plot_similarity_heatmap(pairs: pd.DataFrame, out_path: Path, plt) -> None:
-    """Images (rows) x config pairs (columns), colored by cosine similarity."""
+    """Images (rows) x config pairs (columns), colored by cosine similarity.
+    With more images than fit on a page, only the least-similar ones are
+    shown — a row per image of the full set exceeds matplotlib's size limit."""
     n_datasets = pairs["dataset"].nunique()
     pairs = pairs.assign(label=[_image_label(d, i, n_datasets)
                                 for d, i in zip(pairs["dataset"], pairs["image"])])
     table = pairs.pivot(index="label", columns="pair", values="cls_cosine")
     table = table[list(dict.fromkeys(pairs["pair"]))]
     table = table.loc[table.min(axis=1).sort_values().index]
+    shown_of = None
+    if len(table) > HEATMAP_MAX_ROWS:
+        shown_of = len(table)
+        table = table.iloc[:HEATMAP_MAX_ROWS]
 
     fig, ax = plt.subplots(figsize=(2.2 + 1.3 * table.shape[1], 1.2 + 0.35 * table.shape[0]))
     im = ax.imshow(table.to_numpy(), cmap="viridis", aspect="auto",
@@ -297,7 +312,10 @@ def plot_similarity_heatmap(pairs: pd.DataFrame, out_path: Path, plt) -> None:
     ax.set_yticks(range(table.shape[0]))
     ax.set_yticklabels(table.index, fontsize=8)
     ax.set_xlabel("Pipeline pair")
-    ax.set_title("Per-image FEMI embedding similarity\n(least similar at top)")
+    title = "Per-image FEMI embedding similarity\n(least similar at top)"
+    if shown_of is not None:
+        title += f"\n{len(table)} of {shown_of} images shown"
+    ax.set_title(title)
     fig.colorbar(im, ax=ax, label="Cosine similarity")
     fig.tight_layout()
     fig.savefig(out_path, dpi=150)
@@ -322,16 +340,27 @@ def plot_embedding_pca(output_dir: str, configs: list[str], out_path: Path, plt)
     explained = (s[:2] ** 2) / np.sum(s ** 2)
     coords = coords.reshape(len(configs), len(shared), 2)
 
+    # Lines for every image are readable only for small sets. On a large set,
+    # join just the images whose pipelines moved farthest apart.
+    if len(shared) <= 80:
+        line_idx = np.arange(len(shared))
+    else:
+        span = np.linalg.norm(coords.max(axis=0) - coords.min(axis=0), axis=1)
+        line_idx = np.argsort(span)[-40:]
+
     fig, ax = plt.subplots(figsize=(6.5, 5.5))
-    for j in range(len(shared)):
+    for j in line_idx:
         ax.plot(coords[:, j, 0], coords[:, j, 1], color="lightgray", lw=1, zorder=1)
     colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
+    point_size = 36 if len(shared) <= 80 else 8
     for k, c in enumerate(configs):
-        ax.scatter(coords[k, :, 0], coords[k, :, 1], s=36, color=colors[k % len(colors)],
-                   label=c, zorder=2, edgecolor="white", linewidth=0.5)
+        ax.scatter(coords[k, :, 0], coords[k, :, 1], s=point_size, color=colors[k % len(colors)],
+                   label=c, zorder=2, alpha=0.7, edgecolor="none")
     ax.set_xlabel(f"PC1 ({explained[0]:.0%} of variance)")
     ax.set_ylabel(f"PC2 ({explained[1]:.0%} of variance)")
-    ax.set_title("FEMI embeddings by crop pipeline\n(gray line joins the same image)")
+    title = "FEMI embeddings by crop pipeline\n(gray line joins the same image"
+    title += ")" if len(shared) <= 80 else ", 40 that moved the most)"
+    ax.set_title(title)
     ax.legend(title="Pipeline")
     fig.tight_layout()
     fig.savefig(out_path, dpi=150)
