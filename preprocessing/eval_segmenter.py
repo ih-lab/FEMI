@@ -100,6 +100,19 @@ Usage:
         --images-dir new_labels/raw_images --masks-dir new_labels/masks \\
         --mask-suffix _mask --mask-ext .png
 
+    # --mode crops: no masks needed - run configs A/B/C on an unlabeled
+    # folder and only save the crops (+ crop_manifest.csv diagnostics):
+    python eval_segmenter.py --mode crops --configs A,B,C \\
+        --images-dir ../extracted_110-111h_focal0 \\
+        --output-dir segmenter_crops_output/extracted_110-111h_focal0
+
+    # --mode pipeline: same benchmark on new_valid/, and also write each
+    # config's final 224x224 crop to crops/<config>/<dataset>/:
+    python eval_segmenter.py --mode pipeline --configs A,B,C \\
+        --images-dir new_valid/raw_images --masks-dir new_valid/mask_valid \\
+        --mask-suffix _mask --mask-ext .png\\
+        --save-crops --output-dir segmenter_pipeline_eval_output/
+
 Outputs (written to --output-dir):
   --mode model (default dir: ./segmenter_eval_output):
     per_image_metrics.csv   one row per (model, image): dice, iou, hd, hd95 @ --threshold
@@ -125,6 +138,16 @@ Outputs (written to --output-dir):
     pipeline_resources.png          3-panel deployability figure: latency, throughput,
                                     model storage (params + checkpoint + RAM)
     pipeline_latency_box.png        per-image end-to-end latency distribution per config
+    crops/<config>/<dataset>/      only with --save-crops: one folder per
+                                    pipeline config, each holding that
+                                    config's final 224x224 crop (original
+                                    filename). A is the warp crop; B and C
+                                    are the squarified crop.
+
+  --mode crops (default dir: ./segmenter_crops_output):
+    crops/<config>/<dataset>/       each config's final 224x224 crop (original filename)
+    crop_manifest.csv               one row per (dataset, config, image): bbox, crop area,
+                                    border/background/distortion/fallback flags
 
 No new dependencies: only numpy/torch/opencv/pillow (already required by
 EmbryoSegmenter/requirements-segmenter.txt) plus matplotlib for plots (also
@@ -499,6 +522,37 @@ def run_config_new_pipeline(model, img, max_area_frac=0.9, border_margin=2,
         "brightness_fallback_triggered": None,  # N/A - always brightness-corrected, no retry concept
         "full_image_fallback_triggered": full_image_fallback,
     }
+
+
+def render_pipeline_crop(img, result, out_size=(224, 224)):
+    """The 224x224 image this config would write for `img`.
+
+    Config A (`crop_style="warp"`) slices the raw box and force-resizes,
+    matching the previous production crop: `find_bounding_box` returns
+    inclusive corners, and the slice treats them as an exclusive end.
+    Configs B and C (`crop_style="squarify"`) expand that box to a square
+    with `squarify_bbox` first, then resize, matching
+    `preprocessing_images.py` and `run_segmenter_inspect.py`. The crop is
+    taken from the original (already 224x224) frame, not the
+    brightness-adjusted copy the segmenter saw.
+    """
+    min_x, min_y, max_x, max_y = result["bbox"]
+    h, w = img.shape[0], img.shape[1]
+    if result["crop_style"] == "squarify":
+        min_x, min_y, max_x, max_y = squarify_bbox(min_x, min_y, max_x, max_y, w, h)
+    crop = img[int(min_y):int(max_y), int(min_x):int(max_x)]
+    if crop.size == 0:
+        crop = img
+    pil = Image.fromarray(np.clip(crop, 0, 255).astype(np.uint8))
+    return pil.resize(out_size)
+
+
+def save_pipeline_crop(img, result, out_dir, filename):
+    """Write `render_pipeline_crop` to `out_dir/filename`. Returns the path."""
+    os.makedirs(out_dir, exist_ok=True)
+    path = os.path.join(out_dir, filename)
+    render_pipeline_crop(img, result).save(path)
+    return path
 
 
 # ---------------------------------------------------------------------------
@@ -1457,6 +1511,42 @@ def plot_pipeline_latency_box(per_image_rows, out_path):
     print(f"Wrote per-image latency distribution plot to {os.path.abspath(out_path)}")
 
 
+def parse_pipeline_configs(configs_arg):
+    """'A,B,C' -> ['A', 'B', 'C'], exiting on unknown names."""
+    configs = [c.strip() for c in configs_arg.split(",") if c.strip()]
+    unknown = set(configs) - {"A", "B", "C"}
+    if unknown:
+        print(f"ERROR: unknown --configs entries {sorted(unknown)}; choices are "
+              f"['A', 'B', 'C'].", file=sys.stderr)
+        sys.exit(1)
+    return configs
+
+
+def load_pipeline_models(args, configs):
+    """Load only the checkpoints these configs need: production weights for
+    A/B, SegmenterModelSkip weights for C. Returns (prod_model, skip_model)."""
+    prod_model = skip_model = None
+    if any(c in ("A", "B") for c in configs):
+        if not os.path.exists(args.prod_weights):
+            print(f"ERROR: production weights not found at {args.prod_weights}", file=sys.stderr)
+            sys.exit(1)
+        prod_model = load_model(args.prod_weights)
+    if "C" in configs:
+        if not os.path.exists(args.skip_weights):
+            print(f"ERROR: skip-connections weights not found at {args.skip_weights}", file=sys.stderr)
+            sys.exit(1)
+        skip_model = load_model(args.skip_weights)
+    return prod_model, skip_model
+
+
+def run_pipeline_config(config, prod_model, skip_model, img_arr, args):
+    if config == "A":
+        return run_config_a(prod_model, img_arr, min_circularity=args.circularity_threshold)
+    model = skip_model if config == "C" else prod_model
+    return run_config_new_pipeline(model, img_arr, args.max_area_frac,
+                                   args.border_margin, args.min_area_frac)
+
+
 def warmup_pipeline_models(prod_model, skip_model, img_arr, args, n_warmup):
     """Run a few untimed iterations so latency measurements aren't dominated
     by one-time CPU cache / PyTorch thread-pool warmup effects."""
@@ -1652,31 +1742,10 @@ def run_pipeline_mode(args):
         sys.exit(1)
     print(f"Total labeled pairs across all sources: {len(pairs)}\n")
 
-    configs_to_run = [c.strip() for c in args.configs.split(",") if c.strip()]
-    valid_configs = {"A", "B", "C"}
-    unknown = set(configs_to_run) - valid_configs
-    if unknown:
-        print(f"ERROR: unknown --configs entries {sorted(unknown)}; choices are "
-              f"{sorted(valid_configs)}.", file=sys.stderr)
-        sys.exit(1)
-
-    needs_prod = any(c in ("A", "B") for c in configs_to_run)
-    needs_skip = "C" in configs_to_run
-
-    prod_model = skip_model = None
-    n_params_prod = n_params_skip = None
-    if needs_prod:
-        if not os.path.exists(args.prod_weights):
-            print(f"ERROR: production weights not found at {args.prod_weights}", file=sys.stderr)
-            sys.exit(1)
-        prod_model = load_model(args.prod_weights)
-        n_params_prod = sum(p.numel() for p in prod_model.parameters())
-    if needs_skip:
-        if not os.path.exists(args.skip_weights):
-            print(f"ERROR: skip-connections weights not found at {args.skip_weights}", file=sys.stderr)
-            sys.exit(1)
-        skip_model = load_model(args.skip_weights)
-        n_params_skip = sum(p.numel() for p in skip_model.parameters())
+    configs_to_run = parse_pipeline_configs(args.configs)
+    prod_model, skip_model = load_pipeline_models(args, configs_to_run)
+    n_params_prod = sum(p.numel() for p in prod_model.parameters()) if prod_model else None
+    n_params_skip = sum(p.numel() for p in skip_model.parameters()) if skip_model else None
 
     print("Running configs (CPU-only, matching production/run_segmenter_inspect.py):")
     for c in configs_to_run:
@@ -1692,25 +1761,26 @@ def run_pipeline_mode(args):
         print()
 
     per_image_rows = []
+    n_crops_saved = 0
     for dataset_name, stem, img_path, mask_path in pairs:
         img_arr = load_image(img_path)
         img_h, img_w = img_arr.shape[0], img_arr.shape[1]
         gt_bin = load_gt_mask(mask_path, size=(img_w, img_h))
 
         for config in configs_to_run:
-            model = skip_model if config == "C" else prod_model
             t0 = time.perf_counter()
-            if config == "A":
-                result = run_config_a(model, img_arr, min_circularity=args.circularity_threshold)
-            else:  # "B" or "C" - same pipeline, different weights
-                result = run_config_new_pipeline(model, img_arr, args.max_area_frac,
-                                                  args.border_margin, args.min_area_frac)
+            result = run_pipeline_config(config, prod_model, skip_model, img_arr, args)
             latency_ms = (time.perf_counter() - t0) * 1000.0
 
             row = evaluate_pipeline_result(config, dataset_name, stem, result, gt_bin, img_w, img_h,
                                            args.hd_percentile, args.background_area_flag_threshold,
                                            latency_ms)
             per_image_rows.append(row)
+
+            if args.save_crops:
+                crop_dir = os.path.join(args.output_dir, "crops", config, dataset_name)
+                save_pipeline_crop(img_arr, result, crop_dir, os.path.basename(img_path))
+                n_crops_saved += 1
 
     os.makedirs(args.output_dir, exist_ok=True)
     write_csv(os.path.join(args.output_dir, "pipeline_per_image_metrics.csv"), per_image_rows)
@@ -1780,6 +1850,10 @@ def run_pipeline_mode(args):
     plot_pipeline_latency_box(per_image_rows, os.path.join(args.output_dir, "pipeline_latency_box.png"))
 
     print(f"\nDone. All outputs written to {os.path.abspath(args.output_dir)}.")
+    if args.save_crops:
+        print(f"Saved {n_crops_saved} cropped images under "
+              f"{os.path.abspath(os.path.join(args.output_dir, 'crops'))} "
+              f"(one folder per config: {', '.join(configs_to_run)}).")
     print("Deployability: see pipeline_resources.csv, pipeline_resources.png, "
           "and pipeline_latency_box.png.")
     if "old_train" in dataset_names_used or "old_valid" in dataset_names_used:
@@ -1794,6 +1868,95 @@ def run_pipeline_mode(args):
 
 
 # ---------------------------------------------------------------------------
+# --mode crops
+# ---------------------------------------------------------------------------
+
+def run_crops_mode(args):
+    """Run configs A/B/C on unlabeled images and save each config's final
+    224x224 crop - no masks and no metrics, just the images plus a manifest
+    of per-image crop diagnostics. Blank images (max pixel 0) are skipped,
+    as in preprocessing_images.py."""
+    if not args.images_dir:
+        print("ERROR: --mode crops needs at least one --images-dir.", file=sys.stderr)
+        sys.exit(1)
+    dataset_names = _expand_per_pair(args.dataset_name, len(args.images_dir), "dataset-name", None)
+    if dataset_names[0] is None:
+        dataset_names = [os.path.basename(os.path.normpath(d)) for d in args.images_dir]
+
+    configs_to_run = parse_pipeline_configs(args.configs)
+    prod_model, skip_model = load_pipeline_models(args, configs_to_run)
+    print("Running configs (CPU-only):")
+    for c in configs_to_run:
+        print(f"  {c}: {CONFIG_DESCRIPTIONS[c]}")
+
+    crops_root = os.path.join(args.output_dir, "crops")
+    manifest_rows = []
+    n_blank = 0
+    t_start = time.perf_counter()
+
+    for dataset_name, images_dir in zip(dataset_names, args.images_dir):
+        if not os.path.isdir(images_dir):
+            print(f"ERROR: images dir not found: {images_dir}", file=sys.stderr)
+            sys.exit(1)
+        fnames = sorted(f for f in os.listdir(images_dir) if f.lower().endswith(IMAGE_EXTS))
+        print(f"\n[{dataset_name}] {len(fnames)} images in {images_dir}")
+
+        for i, fname in enumerate(fnames, 1):
+            img_arr = load_image(os.path.join(images_dir, fname))
+            if np.max(img_arr) == 0:
+                n_blank += 1
+                continue
+            img_h, img_w = img_arr.shape[0], img_arr.shape[1]
+
+            for config in configs_to_run:
+                result = run_pipeline_config(config, prod_model, skip_model, img_arr, args)
+                out_dir = os.path.join(crops_root, config, dataset_name)
+                crop_path = save_pipeline_crop(img_arr, result, out_dir, fname)
+                diag = compute_crop_diagnostics(result["bbox"], img_w, img_h, result["crop_style"],
+                                                args.background_area_flag_threshold)
+                manifest_rows.append({
+                    "dataset": dataset_name, "config": config, "image": fname,
+                    "crop_path": crop_path,
+                    "bbox_xyxy": " ".join(str(int(v)) for v in result["bbox"]),
+                    "crop_area_fraction": round(diag["crop_area_fraction"], 4),
+                    "bbox_aspect_ratio": round(diag["bbox_aspect_ratio"], 4),
+                    "touches_border": diag["touches_border"],
+                    "possible_background_false_positive": diag["possible_background_false_positive"],
+                    "likely_visible_distortion": diag["likely_visible_distortion"],
+                    "full_image_fallback_triggered": result["full_image_fallback_triggered"],
+                    "brightness_fallback_triggered": result["brightness_fallback_triggered"],
+                })
+
+            if i % 250 == 0 or i == len(fnames):
+                elapsed = time.perf_counter() - t_start
+                print(f"  [{dataset_name}] {i}/{len(fnames)} images ({elapsed / 60:.1f} min elapsed)")
+
+    if not manifest_rows:
+        print("ERROR: no non-blank images found.", file=sys.stderr)
+        sys.exit(1)
+
+    os.makedirs(args.output_dir, exist_ok=True)
+    manifest_path = os.path.join(args.output_dir, "crop_manifest.csv")
+    write_csv(manifest_path, manifest_rows)
+
+    print("\n=== Crop summary per config ===")
+    for config in configs_to_run:
+        rows = [r for r in manifest_rows if r["config"] == config]
+        rate = lambda key: sum(bool(r[key]) for r in rows) / len(rows)
+        print(f"  [{config}] n={len(rows)}  "
+              f"fallback={rate('full_image_fallback_triggered'):.2%}  "
+              f"border={rate('touches_border'):.2%}  "
+              f"bg_fp={rate('possible_background_false_positive'):.2%}  "
+              f"distortion={rate('likely_visible_distortion'):.2%}  "
+              f"mean crop area={np.mean([r['crop_area_fraction'] for r in rows]):.3f}")
+    if n_blank:
+        print(f"Skipped {n_blank} blank image(s).")
+    print(f"\nDone in {(time.perf_counter() - t_start) / 60:.1f} min. Crops under "
+          f"{os.path.abspath(crops_root)}/<config>/<dataset>/; diagnostics in "
+          f"{os.path.abspath(manifest_path)}.")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -1804,9 +1967,10 @@ def build_arg_parser():
                     "checkpoints. --mode pipeline: full end-to-end preprocessing-pipeline "
                     "comparison (model + contour-selection + crop) across named configs "
                     "A/B/C - see module docstring.")
-    parser.add_argument("--mode", choices=["model", "pipeline"], default="model",
-                        help="'model' (default) or 'pipeline' - see module docstring for what "
-                             "each evaluates.")
+    parser.add_argument("--mode", choices=["model", "pipeline", "crops"], default="model",
+                        help="'model' (default), 'pipeline', or 'crops' (run configs on "
+                             "unlabeled --images-dir and only save crops) - see module "
+                             "docstring.")
 
     data = parser.add_argument_group("data selection")
     data.add_argument("--images-dir", action="append", default=None,
@@ -1890,6 +2054,11 @@ def build_arg_parser():
                               help="Untimed pipeline iterations per loaded model before "
                                    "measuring latency (default: 3). Set to 0 to disable. "
                                    "Reduces one-time CPU/PyTorch warmup bias in timing stats.")
+    pipeline_grp.add_argument("--save-crops", action="store_true",
+                              help="Save each config's final 224x224 crop under "
+                                   "<output-dir>/crops/<config>/<dataset>/<original filename>. "
+                                   "Config A is the direct (warp) crop; B and C square the "
+                                   "box before resizing. Off by default.")
 
     shared = parser.add_argument_group("shared options")
     shared.add_argument("--hd-percentile", type=float, default=95.0,
@@ -1913,12 +2082,16 @@ def main():
     args = parser.parse_args()
 
     if args.output_dir is None:
-        args.output_dir = "segmenter_eval_output" if args.mode == "model" else "segmenter_pipeline_eval_output"
+        args.output_dir = {"model": "segmenter_eval_output",
+                           "pipeline": "segmenter_pipeline_eval_output",
+                           "crops": "segmenter_crops_output"}[args.mode]
 
     if args.mode == "model":
         run_model_mode(args)
-    else:
+    elif args.mode == "pipeline":
         run_pipeline_mode(args)
+    else:
+        run_crops_mode(args)
 
 
 if __name__ == "__main__":
