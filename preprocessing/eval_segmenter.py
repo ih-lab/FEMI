@@ -185,15 +185,46 @@ DEFAULT_PIPELINE_SOURCES = [
      os.path.join(SCRIPT_DIR, "new_valid", "mask_valid"), "_mask", ".png"),
 ]
 
-CONFIG_DESCRIPTIONS = {
-    "A": "previous production pipeline: circularity>0.7 contour union, "
-         "conditional brightness-retry, direct/warp crop; production weights",
-    "B": "preprocessing_images.py pipeline, production weights: "
-         "select_best_contour + always-brightness-first + squarify crop",
-    "C": "new pipeline, NEW model: select_best_contour + always-brightness-first "
-         "+ squarify crop; SegmenterModelSkip weights",
+# --mode pipeline / --mode crops: each config is one combination of the
+# pipeline's interchangeable steps, all run by `run_pipeline_config()`:
+#   weights_arg  which CLI option holds the checkpoint path ("prod_weights"
+#                or "skip_weights"); the architecture is auto-detected by
+#                `load_model()`, so only the path is needed here.
+#   brightness   "none" (segment the raw image), "always" (brightness-correct
+#                first, one forward pass), or "retry_if_empty" (segment the
+#                raw image, and only if the filtered mask is empty retry once
+#                on a brightness-corrected copy).
+#   contour      "circularity_union" (`filter_mask_by_circularity_union`) or
+#                "select_best_contour".
+#   crop_style   "warp" (crop the raw box and force-resize) or "squarify"
+#                (`squarify_bbox` first) - see `render_pipeline_crop`.
+# To add a config, add an entry here; nothing else needs to change.
+CONFIG_TYPES = {
+    "A": {
+        "description": "previous production pipeline: circularity>0.7 contour union, "
+                       "conditional brightness-retry, direct/warp crop; production weights",
+        "weights_arg": "prod_weights", 
+        "brightness": "retry_if_empty",
+        "contour": "circularity_union", 
+        "crop_style": "warp",
+    },
+    "B": {
+        "description": "preprocessing_images.py pipeline, production weights: "
+                       "select_best_contour + always-brightness-first + squarify crop",
+        "weights_arg": "prod_weights", 
+        "brightness": "always",
+        "contour": "select_best_contour", 
+        "crop_style": "squarify",
+    },
+    "C": {
+        "description": "new pipeline, NEW model: select_best_contour + always-brightness-first "
+                       "+ squarify crop; SegmenterModelSkip weights",
+        "weights_arg": "skip_weights", 
+        "brightness": "always",
+        "contour": "select_best_contour", 
+        "crop_style": "squarify",
+    },
 }
-
 
 # ---------------------------------------------------------------------------
 # Shared low-level pipeline primitives (moved from run_segmenter_inspect.py -
@@ -456,72 +487,22 @@ def filter_mask_by_circularity_union(mask, min_circularity=0.7):
 
 
 # ---------------------------------------------------------------------------
-# --mode pipeline: named config runners.
+# --mode pipeline: config runner.
 # ---------------------------------------------------------------------------
 
-def run_config_a(model, img, min_circularity=0.7):
-    """
-    Config A: the previous preprocessing_images.py pipeline. Segment the
-    RAW image first; keep the circularity-union filtered mask; if empty,
-    retry ONCE on a brightness/contrast-corrected copy; if STILL empty,
-    fall back to the full frame. `raw_mask` in the returned dict is
-    whichever forward pass's output actually ended up feeding the
-    (possibly-empty) filtered mask - i.e. the retry's output if a retry
-    happened, else the first pass's. Crop style is "warp": this config
-    crops directly to the (possibly non-square) box and force-resizes to
-    224x224, which distorts the embryo's shape whenever the box isn't
-    square - see `compute_crop_diagnostics`.
-    """
-    raw_mask = segment_image(model, img)
-    filtered_mask = filter_mask_by_circularity_union(raw_mask, min_circularity)
-    brightness_fallback = False
-    if np.max(filtered_mask) == 0:
-        brightness_fallback = True
-        bright_img = automatic_brightness_and_contrast(img)
-        raw_mask = segment_image(model, bright_img)
-        filtered_mask = filter_mask_by_circularity_union(raw_mask, min_circularity)
-    full_image_fallback = False
-    if np.max(filtered_mask) == 0:
-        full_image_fallback = True
-        filtered_mask = np.ones_like(filtered_mask)
-    bbox = find_bounding_box(filtered_mask)
-    return {
-        "raw_mask": raw_mask, "filtered_mask": filtered_mask, "bbox": bbox,
-        "crop_style": "warp",
-        "brightness_fallback_triggered": brightness_fallback,
-        "full_image_fallback_triggered": full_image_fallback,
-    }
+def apply_contour_filter(contour, raw_mask, args):
+    """Run the contour step named by a config's "contour" entry. Returns the
+    filtered mask (float, 0.0/1.0)."""
+    if contour == "circularity_union":
+        return filter_mask_by_circularity_union(raw_mask, args.circularity_threshold)
+    if contour == "select_best_contour":
+        filtered_mask, _selected_contour = select_best_contour(
+            raw_mask, args.max_area_frac, args.border_margin, args.min_area_frac)
+        return filtered_mask
+    raise ValueError(f"Contour function {contour!r} not supported")
 
 
-def run_config_new_pipeline(model, img, max_area_frac=0.9, border_margin=2,
-                             min_area_frac=0.1):
-    """
-    The "Phase 1" pipeline from run_segmenter_inspect.py, parameterized by
-    `model` to cover configs B and C with one function:
-      B = run_config_new_pipeline(prod_model, img, ...)
-      C = run_config_new_pipeline(skip_model, img, ...)
 
-    ALWAYS brightness-corrects first (unlike config A's conditional
-    retry - there is only ever one forward pass here), then picks a
-    single best contour via `select_best_contour` (no circularity check),
-    and uses the "squarify" crop style (see squarify_bbox()). B and C
-    differ only in the weights.
-    """
-    bright_img = automatic_brightness_and_contrast(img)
-    raw_mask = segment_image(model, bright_img)
-    filtered_mask, _selected_contour = select_best_contour(
-        raw_mask, max_area_frac, border_margin, min_area_frac)
-    full_image_fallback = False
-    if np.max(filtered_mask) == 0:
-        full_image_fallback = True
-        filtered_mask = np.ones_like(filtered_mask)
-    bbox = find_bounding_box(filtered_mask)
-    return {
-        "raw_mask": raw_mask, "filtered_mask": filtered_mask, "bbox": bbox,
-        "crop_style": "squarify",
-        "brightness_fallback_triggered": None,  # N/A - always brightness-corrected, no retry concept
-        "full_image_fallback_triggered": full_image_fallback,
-    }
 
 
 def render_pipeline_crop(img, result, out_size=(224, 224)):
@@ -832,7 +813,7 @@ def compute_crop_diagnostics(bbox, img_w, img_h, crop_style, background_area_fla
 def evaluate_pipeline_result(config, dataset_name, stem, result, gt_bin, img_w, img_h,
                               hd_percentile, background_area_flag_threshold, latency_ms):
     """Builds one --mode pipeline per-image CSV row from a
-    run_config_a()/run_config_new_pipeline() result plus the ground-truth
+    run_pipeline_config() result plus the ground-truth
     mask: Tier 1 (raw mask) + Tier 2 (post-contour mask) Dice/IoU/HD95,
     Tier 3 (bbox IoU, embryo recall, centroid distance, crop diagnostics),
     fallback flags, and latency."""
@@ -930,14 +911,13 @@ def model_storage_stats(model, weights_path):
     }
 
 
-def build_pipeline_resource_rows(summary_all, prod_model, skip_model, prod_weights, skip_weights):
-    """One deployability row per pipeline config (ALL-dataset summary only)."""
-    storage_prod = model_storage_stats(prod_model, prod_weights) if prod_model else None
-    storage_skip = model_storage_stats(skip_model, skip_weights) if skip_model else None
+def build_pipeline_resource_rows(summary_all, models):
+    """One deployability row per pipeline config (ALL-dataset summary only).
+    `models` is load_pipeline_models()'s {config: (model, weights_path)}."""
     rows = []
     for summary in summary_all:
         config = summary["config"]
-        storage = storage_skip if config == "C" else storage_prod
+        storage = model_storage_stats(*models[config])
         rows.append({
             "config": config,
             "weights_path": storage["weights_path"],
@@ -1512,55 +1492,84 @@ def plot_pipeline_latency_box(per_image_rows, out_path):
 
 
 def parse_pipeline_configs(configs_arg):
-    """'A,B,C' -> ['A', 'B', 'C'], exiting on unknown names."""
+    """'A,B,C' -> ['A', 'B', 'C'], exiting on names not in CONFIG_TYPES."""
     configs = [c.strip() for c in configs_arg.split(",") if c.strip()]
-    unknown = set(configs) - {"A", "B", "C"}
+    unknown = set(configs) - set(CONFIG_TYPES)
     if unknown:
         print(f"ERROR: unknown --configs entries {sorted(unknown)}; choices are "
-              f"['A', 'B', 'C'].", file=sys.stderr)
+              f"{sorted(CONFIG_TYPES)}.", file=sys.stderr)
         sys.exit(1)
     return configs
 
 
 def load_pipeline_models(args, configs):
-    """Load only the checkpoints these configs need: production weights for
-    A/B, SegmenterModelSkip weights for C. Returns (prod_model, skip_model)."""
-    prod_model = skip_model = None
-    if any(c in ("A", "B") for c in configs):
-        if not os.path.exists(args.prod_weights):
-            print(f"ERROR: production weights not found at {args.prod_weights}", file=sys.stderr)
-            sys.exit(1)
-        prod_model = load_model(args.prod_weights)
-    if "C" in configs:
-        if not os.path.exists(args.skip_weights):
-            print(f"ERROR: skip-connections weights not found at {args.skip_weights}", file=sys.stderr)
-            sys.exit(1)
-        skip_model = load_model(args.skip_weights)
-    return prod_model, skip_model
+    """Load the checkpoint each config needs (its "weights_arg" CLI option).
+    A checkpoint shared by several configs (e.g. A and B) is loaded once.
+    Returns {config: (model, weights_path)}."""
+    loaded = {}
+    models = {}
+    for config in configs:
+        arg_name = CONFIG_TYPES[config]["weights_arg"]
+        weights_path = getattr(args, arg_name)
+        if weights_path not in loaded:
+            if not os.path.exists(weights_path):
+                print(f"ERROR: --{arg_name.replace('_', '-')} weights for config {config} "
+                      f"not found at {weights_path}", file=sys.stderr)
+                sys.exit(1)
+            loaded[weights_path] = load_model(weights_path)
+        models[config] = (loaded[weights_path], weights_path)
+    return models
 
 
-def run_pipeline_config(config, prod_model, skip_model, img_arr, args):
-    if config == "A":
-        return run_config_a(prod_model, img_arr, min_circularity=args.circularity_threshold)
-    model = skip_model if config == "C" else prod_model
-    return run_config_new_pipeline(model, img_arr, args.max_area_frac,
-                                   args.border_margin, args.min_area_frac)
+def run_pipeline_config(config, models, img, args):
+    """
+    Run one pipeline config (an entry of CONFIG_TYPES) on `img`: optional
+    brightness correction, one forward pass, contour filtering, and a
+    full-frame fallback if the filtered mask is empty.
+
+    `raw_mask` in the returned dict is whichever forward pass's output fed
+    the filtered mask - the retry's output if a "retry_if_empty" retry
+    happened. `brightness_fallback_triggered` is None unless the config's
+    brightness mode is "retry_if_empty" (the other modes have no retry).
+    """
+    model, _weights_path = models[config]
+    config_type = CONFIG_TYPES[config]
+    
+    brightness = config_type["brightness"]
+    if brightness not in ("none", "always", "retry_if_empty"):
+        raise ValueError(f"Brightness mode {brightness!r} not supported")
+
+    seg_img = automatic_brightness_and_contrast(img) if brightness == "always" else img
+    raw_mask = segment_image(model, seg_img)
+    filtered_mask = apply_contour_filter(config_type["contour"], raw_mask, args)
+
+    brightness_fallback = None
+    if brightness == "retry_if_empty":
+        brightness_fallback = False
+        if np.max(filtered_mask) == 0:
+            brightness_fallback = True
+            raw_mask = segment_image(model, automatic_brightness_and_contrast(img))
+            filtered_mask = apply_contour_filter(config_type["contour"], raw_mask, args)
+
+    full_image_fallback = False
+    if np.max(filtered_mask) == 0:
+        full_image_fallback = True
+        filtered_mask = np.ones_like(filtered_mask)
+    bbox = find_bounding_box(filtered_mask)
+    return {
+        "raw_mask": raw_mask, "filtered_mask": filtered_mask, "bbox": bbox,
+        "crop_style": config_type["crop_style"],
+        "brightness_fallback_triggered": brightness_fallback,
+        "full_image_fallback_triggered": full_image_fallback,
+    }
 
 
-def warmup_pipeline_models(prod_model, skip_model, img_arr, args, n_warmup):
+def warmup_pipeline_models(models, img_arr, args, n_warmup):
     """Run a few untimed iterations so latency measurements aren't dominated
     by one-time CPU cache / PyTorch thread-pool warmup effects."""
-    if n_warmup <= 0:
-        return
-    if prod_model is not None:
+    for config in models:
         for _ in range(n_warmup):
-            run_config_a(prod_model, img_arr, min_circularity=args.circularity_threshold)
-            run_config_new_pipeline(prod_model, img_arr, args.max_area_frac,
-                                    args.border_margin, args.min_area_frac)
-    if skip_model is not None:
-        for _ in range(n_warmup):
-            run_config_new_pipeline(skip_model, img_arr, args.max_area_frac,
-                                    args.border_margin, args.min_area_frac)
+            run_pipeline_config(config, models, img_arr, args)
 
 
 # ---------------------------------------------------------------------------
@@ -1743,21 +1752,21 @@ def run_pipeline_mode(args):
     print(f"Total labeled pairs across all sources: {len(pairs)}\n")
 
     configs_to_run = parse_pipeline_configs(args.configs)
-    prod_model, skip_model = load_pipeline_models(args, configs_to_run)
-    n_params_prod = sum(p.numel() for p in prod_model.parameters()) if prod_model else None
-    n_params_skip = sum(p.numel() for p in skip_model.parameters()) if skip_model else None
+    models = load_pipeline_models(args, configs_to_run)
+    n_params_by_config = {c: sum(p.numel() for p in model.parameters())
+                          for c, (model, _weights_path) in models.items()}
 
     print("Running configs (CPU-only, matching production/run_segmenter_inspect.py):")
     for c in configs_to_run:
-        print(f"  {c}: {CONFIG_DESCRIPTIONS[c]}")
+        print(f"  {c}: {CONFIG_TYPES[c]['description']}")
     print()
 
     if args.timing_warmup > 0 and pairs:
         _, _, warmup_path, _ = pairs[0]
         warmup_img = load_image(warmup_path)
-        print(f"Timing warmup: {args.timing_warmup} untimed iteration(s) per loaded model "
+        print(f"Timing warmup: {args.timing_warmup} untimed iteration(s) per config "
               f"on {os.path.basename(warmup_path)} ...")
-        warmup_pipeline_models(prod_model, skip_model, warmup_img, args, args.timing_warmup)
+        warmup_pipeline_models(models, warmup_img, args, args.timing_warmup)
         print()
 
     per_image_rows = []
@@ -1769,7 +1778,7 @@ def run_pipeline_mode(args):
 
         for config in configs_to_run:
             t0 = time.perf_counter()
-            result = run_pipeline_config(config, prod_model, skip_model, img_arr, args)
+            result = run_pipeline_config(config, models, img_arr, args)
             latency_ms = (time.perf_counter() - t0) * 1000.0
 
             row = evaluate_pipeline_result(config, dataset_name, stem, result, gt_bin, img_w, img_h,
@@ -1785,7 +1794,6 @@ def run_pipeline_mode(args):
     os.makedirs(args.output_dir, exist_ok=True)
     write_csv(os.path.join(args.output_dir, "pipeline_per_image_metrics.csv"), per_image_rows)
 
-    n_params_by_config = {c: (n_params_skip if c == "C" else n_params_prod) for c in configs_to_run}
     dataset_names_used = sorted({r["dataset"] for r in per_image_rows})
 
     summary_rows = []
@@ -1823,8 +1831,7 @@ def run_pipeline_mode(args):
               f"bg_fp={r['pct_background_false_positive']:.2%}  "
               f"distortion={r['pct_visible_distortion']:.2%}")
 
-    resource_rows = build_pipeline_resource_rows(
-        summary_all, prod_model, skip_model, args.prod_weights, args.skip_weights)
+    resource_rows = build_pipeline_resource_rows(summary_all, models)
     for row in resource_rows:
         for k, v in row.items():
             if isinstance(v, float):
@@ -1884,10 +1891,10 @@ def run_crops_mode(args):
         dataset_names = [os.path.basename(os.path.normpath(d)) for d in args.images_dir]
 
     configs_to_run = parse_pipeline_configs(args.configs)
-    prod_model, skip_model = load_pipeline_models(args, configs_to_run)
+    models = load_pipeline_models(args, configs_to_run)
     print("Running configs (CPU-only):")
     for c in configs_to_run:
-        print(f"  {c}: {CONFIG_DESCRIPTIONS[c]}")
+        print(f"  {c}: {CONFIG_TYPES[c]['description']}")
 
     crops_root = os.path.join(args.output_dir, "crops")
     manifest_rows = []
@@ -1909,7 +1916,7 @@ def run_crops_mode(args):
             img_h, img_w = img_arr.shape[0], img_arr.shape[1]
 
             for config in configs_to_run:
-                result = run_pipeline_config(config, prod_model, skip_model, img_arr, args)
+                result = run_pipeline_config(config, models, img_arr, args)
                 out_dir = os.path.join(crops_root, config, dataset_name)
                 crop_path = save_pipeline_crop(img_arr, result, out_dir, fname)
                 diag = compute_crop_diagnostics(result["bbox"], img_w, img_h, result["crop_style"],

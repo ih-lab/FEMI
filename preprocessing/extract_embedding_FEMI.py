@@ -13,9 +13,12 @@ Run from preprocessing/ with the FEMI environment:
     python extract_embedding_FEMI.py
     python extract_embedding_FEMI.py --crops_dir segmenter_pipeline_eval_output/new_valid/crops
     python extract_embedding_FEMI.py --configs A,C --overwrite
+    python extract_embedding_FEMI.py --configs A,B --save_format both
 
 Outputs:
-    {output_dir}/{config}/embeddings.npy   shape (N, 1024)
+    {output_dir}/{config}/embeddings.npy   shape (N, 1024)              [--save_format npy/both]
+    {output_dir}/{config}/vectors.tsv       N lines, tab-separated      [--save_format tsv/both]
+    {output_dir}/{config}/labels.tsv        N labels, same order        [--save_format tsv/both]
     {output_dir}/{config}/index.csv         N rows: config, dataset, image, filepath
     {output_dir}/pairwise_similarity.csv    one row per (image, config pair)
     {output_dir}/summary.csv                one row per config pair
@@ -25,9 +28,20 @@ Outputs:
     {output_dir}/femi_embedding_pca.png        2D PCA of all embeddings, colored by
                                                config, same image joined by a line
 
-Resumable: if embeddings.npy already exists for a config, extraction is
-skipped for it unless --overwrite is passed (the comparison and plots are
-always rerun, and FEMI is only loaded if something needs extracting).
+vectors.tsv and labels.tsv are the inputs of the Embedding Comparator's
+preprocess_data.py (embedding-comparator/), one model per config:
+    python preprocess_data.py --embeddings_file={config}/vectors.tsv \
+        --metadata_file={config}/labels.tsv --outfile=... --max_k=100
+Labels drop the extension and focal-plane suffix
+(10080161_0335_110.2_M_0.jpg -> 10080161_0335_110.2_M). The comparator needs
+identical labels in identical order across the models it compares; a warning
+is logged when configs differ.
+
+Resumable: if a config's embeddings already exist in either format,
+extraction is skipped for it unless --overwrite is passed; any format asked
+for by --save_format that is missing is written from the saved embeddings
+(the comparison and plots are always rerun, and FEMI is only loaded if
+something needs extracting).
 Plots need matplotlib; without it the CSVs are still written.
 """
 
@@ -51,6 +65,7 @@ DEFAULT_CROPS_DIR = SCRIPT_DIR / "segmenter_crops_output" / "crops"
 DEFAULT_OUTPUT_DIR = SCRIPT_DIR / "segmenter_crops_output" / "femi_embeddings"
 DEFAULT_FEMI_CKPT = SCRIPT_DIR.parent / "torch_model_maskRatio075_18mill"
 IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp")
+SAVE_FORMATS = ("npy", "tsv", "both")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -132,27 +147,98 @@ class FEMIEncoder:
         return hidden[:, 0].cpu().numpy()
 
 
+# ── Saving ────────────────────────────────────────────────────────────────
+
+def comparator_label(image: str) -> str:
+    """Embedding Comparator label: 10080161_0335_110.2_M_0.jpg -> 10080161_0335_110.2_M."""
+    stem = os.path.splitext(image)[0]
+    return stem.rsplit("_", 1)[0]
+
+
+def output_files(out_dir: Path, save_format: str) -> list[Path]:
+    """Files a config's output folder holds for the given --save_format."""
+    files = [out_dir / "index.csv"]
+    if save_format in ("npy", "both"):
+        files.append(out_dir / "embeddings.npy")
+    if save_format in ("tsv", "both"):
+        files += [out_dir / "vectors.tsv", out_dir / "labels.tsv"]
+    return files
+
+
+def saved_embeddings_path(out_dir: Path) -> Path | None:
+    """Embeddings already on disk for a config, in either format."""
+    for name in ("embeddings.npy", "vectors.tsv"):
+        if (out_dir / name).exists() and (out_dir / "index.csv").exists():
+            return out_dir / name
+    return None
+
+
+def load_saved_embeddings(path: Path) -> np.ndarray:
+    if path.suffix == ".npy":
+        return np.load(path)
+    return np.loadtxt(path, delimiter="\t", dtype=np.float32, ndmin=2)
+
+
+def save_embeddings(embeddings: np.ndarray, meta: pd.DataFrame, out_dir: Path,
+                    save_format: str) -> None:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    meta.to_csv(out_dir / "index.csv", index=False)
+    if save_format in ("npy", "both"):
+        np.save(out_dir / "embeddings.npy", embeddings)
+    if save_format in ("tsv", "both"):
+        np.savetxt(out_dir / "vectors.tsv", embeddings, fmt="%.7g", delimiter="\t")
+        labels = [comparator_label(image) for image in meta["image"]]
+        (out_dir / "labels.tsv").write_text("\n".join(labels) + "\n")
+    saved = ", ".join(p.name for p in output_files(out_dir, save_format))
+    log.info(f"[{out_dir.name}] saved {embeddings.shape} → {out_dir} ({saved})")
+
+
+def check_comparator_labels(meta_all: pd.DataFrame) -> None:
+    """Exit before extraction if a config's labels would collide."""
+    for config, meta in meta_all.groupby("config"):
+        labels = meta["image"].map(comparator_label)
+        dupes = labels[labels.duplicated()].unique()
+        if len(dupes):
+            sys.exit(f"ERROR: [{config}] {len(dupes)} labels.tsv labels are not unique "
+                     f"(e.g. {dupes[0]}); use --save_format npy for this crops folder.")
+
+
+def warn_if_labels_differ(output_dir: str, configs: list[str]) -> None:
+    """The Embedding Comparator matches objects across models by position."""
+    labels = {c: (Path(output_dir) / c / "labels.tsv").read_text() for c in configs}
+    for c in configs[1:]:
+        if labels[c] != labels[configs[0]]:
+            log.warning(f"labels.tsv of {c} and {configs[0]} differ - the Embedding "
+                        "Comparator needs identical labels in identical order.")
+
+
 # ── Extraction ────────────────────────────────────────────────────────────
 
 def extract(
-    model: FEMIEncoder,
+    model: FEMIEncoder | None,
     config: str,
     meta: pd.DataFrame,
     output_dir: str,
+    save_format: str = "npy",
     batch_size: int = 64,
     num_workers: int = 4,
     overwrite: bool = False,
 ) -> None:
     out_dir = Path(output_dir) / config
-    emb_path = out_dir / "embeddings.npy"
-    idx_path = out_dir / "index.csv"
 
-    if emb_path.exists() and not overwrite:
-        log.info(f"[{config}] embeddings already exist at {emb_path} — skipping.")
-        log.info("Pass --overwrite to re-extract.")
-        return
+    if not overwrite:
+        if all(p.exists() for p in output_files(out_dir, save_format)):
+            log.info(f"[{config}] embeddings already exist in {out_dir} — skipping "
+                     "(pass --overwrite to re-extract).")
+            return
+        saved_path = saved_embeddings_path(out_dir)
+        if saved_path is not None:
+            log.info(f"[{config}] writing --save_format {save_format} from {saved_path} "
+                     "(no re-extraction).")
+            save_embeddings(load_saved_embeddings(saved_path),
+                            pd.read_csv(out_dir / "index.csv"), out_dir, save_format)
+            return
 
-    out_dir.mkdir(parents=True, exist_ok=True)
     log.info(f"[{config}] {len(meta)} frames to embed")
 
     dataset = FrameDataset(meta["filepath"].tolist(), model.preprocess)
@@ -179,11 +265,7 @@ def extract(
         f"expected ({len(meta)}, {model.embed_dim})"
     )
 
-    np.save(emb_path, embeddings)
-    meta.to_csv(idx_path, index=False)
-
-    log.info(f"[{config}] saved embeddings {embeddings.shape} → {emb_path}")
-    log.info(f"[{config}] saved index ({len(meta)} rows) → {idx_path}")
+    save_embeddings(embeddings, meta, out_dir, save_format)
 
 
 # ── Comparison ────────────────────────────────────────────────────────────
@@ -191,7 +273,7 @@ def extract(
 def load_config_embeddings(output_dir: str, config: str) -> pd.DataFrame:
     """Saved embeddings for one config, keyed by (dataset, image)."""
     out_dir = Path(output_dir) / config
-    emb = np.load(out_dir / "embeddings.npy")
+    emb = load_saved_embeddings(saved_embeddings_path(out_dir))
     idx = pd.read_csv(out_dir / "index.csv")
     idx["embedding"] = list(emb)
     return idx.set_index(["dataset", "image"])["embedding"]
@@ -408,6 +490,11 @@ if __name__ == "__main__":
         "--femi_ckpt", default=str(DEFAULT_FEMI_CKPT),
         help="PyTorch FEMI checkpoint folder (Hugging Face ViT-MAE format)",
     )
+    parser.add_argument(
+        "--save_format", choices=SAVE_FORMATS, default="npy",
+        help="npy: embeddings.npy; tsv: vectors.tsv + labels.tsv for the Embedding "
+             "Comparator's preprocess_data.py; both: all of them (index.csv is always written)",
+    )
     parser.add_argument("--batch_size",  type=int, default=64)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--device",      default="cuda" if torch.cuda.is_available() else "cpu")
@@ -426,26 +513,30 @@ if __name__ == "__main__":
     configs = sorted(meta_all["config"].unique())
     log.info(f"Found configs {configs} under {crops_dir}")
 
+    writes_tsv = args.save_format in ("tsv", "both")
+    if writes_tsv:
+        check_comparator_labels(meta_all)
+
     to_extract = [c for c in configs
-                  if args.overwrite or not (Path(args.output_dir) / c / "embeddings.npy").exists()]
+                  if args.overwrite or saved_embeddings_path(Path(args.output_dir) / c) is None]
     model = None
     if to_extract:
         model = FEMIEncoder(args.femi_ckpt, device=args.device)
         log.info(f"Loaded FEMI encoder from {args.femi_ckpt} on {args.device} (inference only)")
 
     for config in configs:
-        if config not in to_extract:
-            log.info(f"[{config}] embeddings already exist — skipping (pass --overwrite to re-extract).")
-            continue
         extract(
             model        = model,
             config       = config,
             meta         = meta_all[meta_all["config"] == config].reset_index(drop=True),
             output_dir   = args.output_dir,
+            save_format  = args.save_format,
             batch_size   = args.batch_size,
             num_workers  = args.num_workers,
             overwrite    = args.overwrite,
         )
 
+    if writes_tsv:
+        warn_if_labels_differ(args.output_dir, configs)
     compare_configs(args.output_dir, configs)
     plot_comparison(args.output_dir, configs)
