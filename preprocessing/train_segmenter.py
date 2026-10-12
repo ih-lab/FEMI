@@ -1,96 +1,42 @@
 """
 train_segmenter.py
 
-Training/fine-tuning script for `EmbryoSegmenter/SegmenterModel.py`. Fills
-a gap noted in SEGMENTER_ACCURACY_ROADMAP.md ("no existing segmenter
-training script or dataset"), and plugs directly into
-`labelme_json_to_mask.py`'s output convention: masks are single-channel
-0/255 PNGs named "<image_stem>_mask.png", at the ORIGINAL image resolution.
-This script resizes each image/mask pair together at load time (image:
-bilinear, mask: nearest), so mask and image always end up pixel-aligned
-regardless of source resolution.
+Train or fine-tune the embryo segmenter on (raw image, binary mask) pairs.
+Masks are 0/255 images named "<image_stem><mask_suffix><mask_ext>" (default
+"_mask.png", as written by labelme_json_to_mask.py). Image and mask are
+resized together to 224x224 at load time.
 
-Handling "some existing masks are inaccurate": pass MULTIPLE
---images-dir/--masks-dir pairs (or --manifest rows). Pairs are matched by
-file stem, and later sources OVERRIDE earlier ones for the same stem. So
-to replace old, inaccurate masks with newly corrected ones, just list your
-corrected masks directory LAST:
+Data:
+  - Repeat --images-dir/--masks-dir for several sources; on a filename stem
+    collision the later source wins, so list corrected masks last.
+  - The original paper dataset names masks like the image: use
+    --mask-suffix "" --mask-ext .jpg.
+  - Validation is a random --val-frac split (default 0.2), or a fixed set via
+    --val-images-dir/--val-masks-dir, optionally topped up with --extra-val-frac.
 
-    python train_segmenter.py \\
-        --images-dir /path/to/old/raw_images --masks-dir /path/to/old/masks \\
-        --images-dir /path/to/new/raw_images --masks-dir preprocessing/masks
+Options worth knowing:
+  --skip-connections    train SegmenterModelSkip; most production weights still
+                        transfer (see load_compatible_state_dict)
+  --brightness-correct  apply automatic_brightness_and_contrast() as at inference
+  --freeze-encoder      fine-tune only the decoder
 
-Only run this on machines/environments where you're comfortable running
-model training (needs more compute than this directory's inference-only
-tools - see SEGMENTER_PERFORMANCE_ANALYSIS.md). No new dependencies beyond
-requirements-segmenter.txt (torch, numpy, pillow) - OpenCV is only needed
-with --brightness-correct (below).
-
-Brightness/contrast correction (--brightness-correct): applies the same
-`automatic_brightness_and_contrast()` that the new inference pipeline
-(`run_segmenter_inspect.py`, eval_segmenter.py configs B/C) runs on every
-image before segmenting it, so the model is trained on the same kind of
-input it sees at inference. Off by default, so existing runs reproduce as
-before - but a checkpoint trained WITHOUT it is fed corrected images it
-never saw during training when used in the new pipeline. Applied to both
-train and val images (and --preview-only previews).
-
-Fidelity to the original method (Rajendran et al. 2025) and what this
-script does/doesn't reproduce: see SEGMENTER_ACCURACY_ROADMAP.md §3. In
-short, --val-frac (default 0.2) and the augmentation set (crop/flip/
-rotation, approximating "translation" - see SegmentationDataset) match the
-paper's stated 80/20 split and augmentation types; --skip-connections
-(below) closes part of the paper's "U-Net" gap but not all of it; loss/lr/
-epoch count are this script's own defaults, not values from the paper.
-
-Skip connections (--skip-connections): trains `SegmenterModelSkip`, a
-U-Net variant of `SegmenterModel` DEFINED IN THIS FILE (EmbryoSegmenter/
-SegmenterModel.py is left untouched - see that class's docstring below).
-Off by default. Most of --init-weights still transfers (see
-`load_compatible_state_dict`); run_segmenter_inspect.py auto-detects and
-loads these checkpoints transparently. Cost/rationale: see
-SEGMENTER_ACCURACY_ROADMAP.md Root cause C and
-SEGMENTER_PERFORMANCE_ANALYSIS.md §3.1.
-
-Using the ORIGINAL 30-pair dataset (if you have it): unlike
-labelme_json_to_mask.py's output, the original dataset's masks are
-typically plain JPEGs named identically to the raw image (no "_mask"
-suffix, e.g. "foo.jpg" raw + "foo.jpg" mask in a separate folder), not
-"_mask.png". Use --mask-suffix "" --mask-ext .jpg to match that layout.
-Mask pixel values don't need to be clean 0/255 - SegmentationDataset
-resizes masks with nearest-neighbor and thresholds at 127 when building
-the training tensor, so mild JPEG artifacts in the source mask don't
-affect training. If the original data also came with its own pre-defined
-train/validation split (e.g. separate "mask" and "mask_valid" folders),
-pass the validation folder(s) via --val-images-dir/--val-masks-dir to use
-that split directly instead of --val-frac's random shuffle - see example 4
-below. That folder alone can be tiny and give a noisy validation signal;
-add --extra-val-frac to pull additional examples from the training pool
-into validation too (see that flag's help text and `plot_training_curves`).
-
-Monitoring for overfitting: by default (unless --no-plot is passed), a
-training_curves.png (train vs. val loss/dice/IoU per epoch) and
-training_history.csv (the raw numbers) are written to --output-dir at the
-end of every run - see `plot_training_curves` below for how to read it.
+Each run writes checkpoints, latest.pt, training_history.csv, and (unless
+--no-plot) training_curves.png to --output-dir.
 
 Usage:
-    # Sanity-check your data pairing/alignment before spending time training:
-    python train_segmenter.py --images-dir raw/ --masks-dir preprocessing/masks \\
+    # Check pairing/alignment first:
+    python train_segmenter.py --images-dir raw/ --masks-dir masks/ \\
         --preview-only --preview-dir preview/
 
-    # Fine-tune from the current production weights (recommended default):
-    python train_segmenter.py --images-dir raw/ --masks-dir preprocessing/masks \\
+    # Fine-tune from production weights:
+    python train_segmenter.py --images-dir raw/ --masks-dir masks/ \\
         --epochs 50 --output-dir EmbryoSegmenter/weights_finetuned
 
-    # Train from scratch instead:
-    python train_segmenter.py --images-dir raw/ --masks-dir preprocessing/masks \\
-        --from-scratch --epochs 200 --output-dir EmbryoSegmenter/weights_finetuned
-
-    # Try the U-Net (skip-connection) variant, fine-tuned from production weights:
-    python train_segmenter.py --images-dir raw/ --masks-dir preprocessing/masks \\
+    # U-Net variant:
+    python train_segmenter.py --images-dir raw/ --masks-dir masks/ \\
         --skip-connections --epochs 50 --output-dir EmbryoSegmenter/weights_skip
 
-    # Original 30-pair dataset + new Labelme labels (different mask naming):
+    # Original paper data + new Labelme labels, with fixed validation sets:
     python train_segmenter.py \\
         --images-dir mask/psd --masks-dir mask/Embryo \\
         --images-dir new_labels/raw_images --masks-dir new_labels/masks \\
@@ -103,10 +49,8 @@ Usage:
         --freeze-encoder \\
         --epochs 50 --output-dir EmbryoSegmenter/weights_finetuned
 
-After training, use run_segmenter_inspect.py with `--weights
-path/to/new/checkpoint.pt` to visually compare the new model against the
-current production one on a handful of images BEFORE promoting it (i.e.
-before copying it over EmbryoSegmenter/weights/epoch_102_loss_0.098710.pt).
+Check a new checkpoint with run_segmenter_inspect.py --weights or
+eval_segmenter.py before promoting it.
 """
 
 import argparse
@@ -118,11 +62,10 @@ import sys
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from PIL import Image, ImageEnhance
 from torch.utils.data import DataLoader, Dataset
 
-from EmbryoSegmenter.SegmenterModel import BasicConv2d, BasicConv2dSigmoid, SegmenterModel
+from EmbryoSegmenter.SegmenterModel import SegmenterModel, SegmenterModelSkip
 
 DEFAULT_INIT_WEIGHTS = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
@@ -131,94 +74,12 @@ DEFAULT_INIT_WEIGHTS = os.path.join(
 IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp")
 
 
-# ---------------------------------------------------------------------------
-# Model: optional skip-connection (U-Net) variant.
-#
-# Defined HERE, not in EmbryoSegmenter/SegmenterModel.py, by design: that
-# file stays untouched, so production inference (preprocessing_images.py,
-# run_segmenter_inspect.py) keeps using the original architecture unless and
-# until a skip-connection checkpoint trained here is explicitly validated
-# and ported over (at which point run_segmenter_inspect.py would also need
-# updating to import this class - it currently only knows SegmenterModel).
-# ---------------------------------------------------------------------------
-
-class SegmenterModelSkip(nn.Module):
-    """
-    U-Net variant of `SegmenterModel`: same encoder and the same
-    `BasicConv2d`/`BasicConv2dSigmoid` building blocks, but each decoder
-    stage concatenates the matching encoder stage's pre-pool feature map
-    (a "skip connection") before its conv, so boundary detail doesn't have
-    to be reconstructed from the 7x7x512 bottleneck alone. Rationale and
-    cost: see SEGMENTER_ACCURACY_ROADMAP.md Root cause C and
-    SEGMENTER_PERFORMANCE_ANALYSIS.md §3.1.
-
-    Only 5 of ~72 weight tensors differ in shape from `SegmenterModel`: the
-    `conv.weight` of `deconv4`/`deconv3`/`deconv2`/`deconv1`/`decoded` (their
-    input channel count doubles from the concatenation). Everything else -
-    the whole encoder, `deconv5` (which consumes the bottleneck directly,
-    nothing to concatenate there), and even the BatchNorm parameters of
-    those 5 changed layers (their output channel count is unchanged) -
-    matches `SegmenterModel` exactly by name and shape. See
-    `load_compatible_state_dict` below, which uses this to fine-tune from
-    the existing production checkpoint instead of training from scratch.
-    """
-
-    def __init__(self):
-        super().__init__()
-        self.conv1 = BasicConv2d(1, 16, kernel_size=3)
-        self.conv2 = BasicConv2d(16, 32, kernel_size=3)
-        self.conv3 = BasicConv2d(32, 64, kernel_size=3)
-        self.conv4 = BasicConv2d(64, 128, kernel_size=3)
-        self.conv5 = BasicConv2d(128, 256, kernel_size=3)
-        self.conv6 = BasicConv2d(256, 512, kernel_size=3)
-
-        self.deconv5 = BasicConv2d(512, 256, kernel_size=3)
-        self.deconv4 = BasicConv2d(256 + 256, 128, kernel_size=3)
-        self.deconv3 = BasicConv2d(128 + 128, 64, kernel_size=3)
-        self.deconv2 = BasicConv2d(64 + 64, 32, kernel_size=3)
-        self.deconv1 = BasicConv2d(32 + 32, 16, kernel_size=3)
-        self.decoded = BasicConv2dSigmoid(16 + 16, 1, kernel_size=3)
-
-    def forward(self, x):
-        # ----------------------- Encoder (downsampling) -----------------------
-        # Keep each pre-pool feature map (c1..c5) around for the skip
-        # connections below - this is the only structural difference from
-        # SegmenterModel.forward(), which discards them.
-        c1 = self.conv1(x)
-        p1 = F.max_pool2d(c1, kernel_size=2, stride=2)
-        c2 = self.conv2(p1)
-        p2 = F.max_pool2d(c2, kernel_size=2, stride=2)
-        c3 = self.conv3(p2)
-        p3 = F.max_pool2d(c3, kernel_size=2, stride=2)
-        c4 = self.conv4(p3)
-        p4 = F.max_pool2d(c4, kernel_size=2, stride=2)
-        c5 = self.conv5(p4)
-        p5 = F.max_pool2d(c5, kernel_size=2, stride=2)
-        c6 = self.conv6(p5)  # 7x7x512 bottleneck
-
-        # ----------------------- Decoder (upsampling + skip connections) -----
-        x = self.deconv5(c6)  # no skip here - c6 IS the direct input already
-        x = F.interpolate(x, scale_factor=2)
-        x = self.deconv4(torch.cat([x, c5], dim=1))
-        x = F.interpolate(x, scale_factor=2)
-        x = self.deconv3(torch.cat([x, c4], dim=1))
-        x = F.interpolate(x, scale_factor=2)
-        x = self.deconv2(torch.cat([x, c3], dim=1))
-        x = F.interpolate(x, scale_factor=2)
-        x = self.deconv1(torch.cat([x, c2], dim=1))
-        x = F.interpolate(x, scale_factor=2)
-        x = self.decoded(torch.cat([x, c1], dim=1))
-        return x
-
-
 def load_compatible_state_dict(model, ckpt_path, device):
     """
-    Load `ckpt_path` into `model`, keeping only entries whose name AND
-    shape match the model's own state dict; everything else is left at its
-    (random) initialization. Used for `--skip-connections` fine-tuning from
-    a checkpoint trained on the original, non-skip `SegmenterModel`
-    architecture - see `SegmenterModelSkip` docstring for exactly which
-    tensors this affects. Returns (n_loaded, n_total, skipped_layer_names).
+    Load only the tensors whose name and shape match `model`; the rest keep
+    their random init. From a SegmenterModel checkpoint into
+    SegmenterModelSkip, only the conv weights of deconv4-1 and decoded differ.
+    Returns (n_loaded, n_total, skipped_layer_names).
     """
     ckpt = torch.load(ckpt_path, map_location=device)
     model_state = model.state_dict()
@@ -236,23 +97,13 @@ def load_compatible_state_dict(model, ckpt_path, device):
 
 
 # ---------------------------------------------------------------------------
-# Pair discovery: match raw images to masks by filename stem, across one or
-# more (images_dir, masks_dir) sources, plus an optional manifest CSV.
-# Later sources win on stem collisions - this is the mechanism for
-# "override inaccurate old masks with corrected new ones".
+# Pair discovery (match by filename stem; later sources win on collisions)
 # ---------------------------------------------------------------------------
 
 def _expand_per_pair(values, n_pairs, flag_name, default):
-    """Expand a CLI list to one entry per (images_dir, masks_dir) pair.
-
-    - None or a single value -> broadcast to all pairs.
-    - len == n_pairs -> use as-is (one convention per pair).
-    - len > n_pairs -> use the *last* n_pairs entries (common when
-      --mask-suffix/--mask-ext were specified both inline after an early
-      pair AND again at the end for all pairs; the trailing block is the
-      intended per-pair list). Emits a warning so the duplication is visible.
-    - len < n_pairs -> raise with a helpful message.
-    """
+    """Expand a repeatable CLI value to one entry per pair: None or one value
+    is broadcast, n_pairs values are used as-is, extra values keep the last
+    n_pairs (with a warning), and too few raise ValueError."""
     if values is None:
         values = [default]
     if len(values) == 1:
@@ -274,13 +125,8 @@ def _expand_per_pair(values, n_pairs, flag_name, default):
 
 
 def discover_pairs(images_dirs, masks_dirs, mask_suffixes=None, mask_exts=None):
-    """Match raw images to masks by filename stem within each (images_dir,
-    masks_dir) pair, expecting masks named "<stem><mask_suffix><mask_ext>".
-
-    mask_suffixes/mask_exts may be a single value (broadcast to every pair)
-    or a per-pair list aligned with images_dirs. Defaults (_mask, .png)
-    match labelme_json_to_mask.py. The original paper dataset uses ("", .jpg).
-    """
+    """{stem: (image_path, mask_path)} for masks named
+    "<stem><mask_suffix><mask_ext>" (default "_mask", ".png"), per pair."""
     if len(images_dirs) != len(masks_dirs):
         raise ValueError("--images-dir and --masks-dir must be given the same number of times "
                           f"(got {len(images_dirs)} images-dir vs {len(masks_dirs)} masks-dir).")
@@ -325,38 +171,13 @@ def load_manifest(manifest_path):
 
 class SegmentationDataset(Dataset):
     """
-    Loads (raw image, binary mask) pairs, resizing both to 224x224 at
-    __getitem__ time (image: bilinear: mask: nearest, to preserve a clean
-    0/1 mask regardless of source resolution - matches the convention
-    documented in labelme_json_to_mask.py).
+    (image, mask) pairs resized to 224x224 (image bilinear, mask nearest).
 
-    Augmentation (train split only) is applied to the ORIGINAL-resolution
-    image+mask pair, before resizing, and is chosen to match the four
-    augmentation types described for the original segmenter training in
-    the FEMI paper (Rajendran et al. 2025, Methods -> "Datasets and
-    preprocessing"): "random cropping, flipping, rotation, and
-    translation":
-      - random crop (a random sub-region, `crop_min_scale`-1.0 of the
-        original size, at a random offset) - this also stands in for
-        "translation", since cropping from a random offset shifts the
-        embryo's position within the eventual 224x224 frame, similar in
-        effect to translating the frame. The paper does not specify exact
-        crop/translation magnitudes, so this is an approximation, not a
-        byte-for-byte reproduction.
-      - horizontal/vertical flip
-      - 90-degree-multiple rotation only (no arbitrary-angle rotation,
-        which would need interpolation and blur the mask's binary edges)
-    If `brightness_correct` is True, `automatic_brightness_and_contrast()`
-    is applied to the FULL original image right after loading, before any
-    augmentation - so, as at inference, the correction is always computed
-    from the whole frame's histogram, never from a random crop of it.
-
-    Brightness/contrast jitter is applied to the image only, after
-    resizing, since it should never affect the mask - the paper does not
-    list this as a training-time augmentation (it describes brightness/
-    contrast correction as a separate, unconditional PREPROCESSING step
-    applied to every image, not a random training-time augmentation), so
-    treat this as an extra addition beyond what's described in the paper.
+    `brightness_correct` runs automatic_brightness_and_contrast() on the full
+    frame first, as at inference. With `augment`, the full-resolution pair gets
+    a random crop (`crop_min_scale` to 1.0, standing in for the paper's
+    cropping and translation), flips, and 90-degree rotations, and the resized
+    image alone gets brightness/contrast jitter (not in the paper).
     """
 
     def __init__(self, pairs, size=(224, 224), augment=False, crop_min_scale=0.85,
@@ -381,7 +202,7 @@ class SegmentationDataset(Dataset):
         return img.crop(box), mask.crop(box)
 
     def _augment_pair(self, img, mask):
-        img, mask = self._random_crop(img, mask)  # approximates paper's "cropping" + "translation"
+        img, mask = self._random_crop(img, mask)
         if random.random() < 0.5:
             img = img.transpose(Image.FLIP_LEFT_RIGHT)
             mask = mask.transpose(Image.FLIP_LEFT_RIGHT)
@@ -405,14 +226,10 @@ class SegmentationDataset(Dataset):
         mask = Image.open(mask_path).convert("L")
 
         if img.size != mask.size:
-            # Should not normally happen if the mask was produced by
-            # labelme_json_to_mask.py against this exact image, but resize
-            # defensively rather than crash on a mismatched pair.
             mask = mask.resize(img.size, Image.NEAREST)
 
         if self.brightness_correct:
-            # Imported here, not at module level: eval_segmenter imports
-            # from this module, so a top-level import would be circular.
+            # Local import: eval_segmenter imports this module.
             from eval_segmenter import automatic_brightness_and_contrast
             img = Image.fromarray(automatic_brightness_and_contrast(np.asarray(img)))
 
@@ -438,10 +255,7 @@ class SegmentationDataset(Dataset):
 # ---------------------------------------------------------------------------
 
 class DiceLoss(nn.Module):
-    """Soft Dice loss on already-sigmoid-activated predictions. Handles the
-    embryo/background class imbalance (embryo is often well under half the
-    frame) better than BCE alone, which can be dominated by the easy
-    "predict background" majority class."""
+    """Soft Dice loss on sigmoid outputs; less sensitive to class imbalance than BCE."""
 
     def __init__(self, eps=1e-6):
         super().__init__()
@@ -508,28 +322,11 @@ def run_epoch(model, loader, loss_fn, device, optimizer=None):
 
 
 def plot_training_curves(history, out_path):
-    """
-    Plot per-epoch train-vs-val loss/dice/IoU curves and save to `out_path`
-    (PNG). This is the "when should I stop training" tool: the classic
-    overfitting signal is train loss still falling while val loss flattens
-    out or starts rising again (and/or val dice/IoU peaking then declining
-    while train dice/IoU keeps climbing) - eyeballing a long column of
-    printed per-epoch numbers makes that gap hard to see, a plot doesn't.
-    A future run's --epochs should generally be set close to where val loss
-    bottoms out here, not run past it.
-
-    Note: with only a handful of validation examples (see --extra-val-frac
-    if you're relying solely on a small fixed --val-images-dir folder),
-    the val curves can be noisy/jumpy epoch-to-epoch independent of any
-    real overfitting - look at the overall trend, not single-epoch blips.
-
-    Requires matplotlib (see EmbryoSegmenter/requirements-segmenter.txt);
-    if it's not installed, prints a warning and skips plotting rather than
-    failing the whole training run.
-    """
+    """Save train vs. val loss/Dice/IoU per epoch. Val loss flattening or rising
+    while train loss falls means overfitting. Skipped if matplotlib is missing."""
     try:
         import matplotlib
-        matplotlib.use("Agg")  # headless-safe (no display/X server needed)
+        matplotlib.use("Agg")
         import matplotlib.pyplot as plt
     except ImportError:
         print(f"WARNING: matplotlib not installed, skipping training-curve plot "
@@ -575,126 +372,67 @@ def save_preview(dataset, out_dir, n=8):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Train/fine-tune SegmenterModel on (raw image, binary mask) pairs, "
-                    "e.g. masks produced by labelme_json_to_mask.py.")
+        description="Train or fine-tune the embryo segmenter on (raw image, binary mask) pairs.")
     parser.add_argument("--images-dir", action="append", required=True,
-                        help="Directory of raw images. Repeatable; pair with --masks-dir "
-                             "in the same order. Later --images-dir/--masks-dir pairs "
-                             "OVERRIDE earlier ones on filename-stem collisions (use this "
-                             "to replace old inaccurate masks with corrected ones).")
+                        help="Raw image directory (repeatable, paired with --masks-dir). "
+                             "Later pairs override earlier ones on stem collisions.")
     parser.add_argument("--masks-dir", action="append", required=True,
-                        help="Directory of mask PNGs matching --images-dir, named "
-                             "'<image_stem><mask-suffix>.png' (see --mask-suffix).")
+                        help="Mask directory for each --images-dir.")
     parser.add_argument("--mask-suffix", action="append", default=None,
-                        help="Mask filename suffix (repeatable, one per --images-dir pair). "
-                             "Default if omitted: _mask (labelme_json_to_mask.py convention, "
-                             "e.g. foo.jpg -> foo_mask.png). Pass '' for the original paper "
-                             "dataset (mask named identically to the image). When combining "
-                             "legacy + Labelme data, pass once per pair AFTER all dirs, e.g. "
-                             "--mask-suffix '' --mask-suffix _mask (not mixed inline with "
-                             "dirs AND repeated at the end).")
+                        help="Mask filename suffix, once or once per pair (default: _mask; "
+                             "'' for the original paper dataset).")
     parser.add_argument("--mask-ext", action="append", default=None,
-                        help="Mask file extension (repeatable, one per --images-dir pair). "
-                             "Default if omitted: .png. Pass '.jpg' for the original paper "
-                             "dataset's lossy JPEG masks. When combining legacy + Labelme "
-                             "data, pass once per pair AFTER all dirs, e.g. "
-                             "--mask-ext .jpg --mask-ext .png.")
+                        help="Mask file extension, once or once per pair (default: .png; "
+                             ".jpg for the original paper dataset).")
     parser.add_argument("--val-mask-suffix", action="append", default=None,
-                        help="Validation mask suffix (repeatable, one per --val-images-dir "
-                             "pair). Default when --val-images-dir is given: '' (legacy "
-                             "mask_valid/ layout). Ignored if --val-images-dir is not used.")
+                        help="Like --mask-suffix, for --val-images-dir (default: '').")
     parser.add_argument("--val-mask-ext", action="append", default=None,
-                        help="Validation mask extension (repeatable). Default when "
-                             "--val-images-dir is given: .jpg. Ignored if --val-images-dir "
-                             "is not used.")
+                        help="Like --mask-ext, for --val-images-dir (default: .jpg).")
     parser.add_argument("--manifest", default=None,
-                        help="Optional CSV with columns image_path,mask_path for pairs "
-                             "that don't fit the directory+suffix convention. Applied "
-                             "after --images-dir/--masks-dir (so it can also override).")
+                        help="Extra CSV of image_path,mask_path pairs, applied last.")
     parser.add_argument("--val-images-dir", action="append", default=[],
-                        help="Directory of raw images reserved for validation ONLY - "
-                             "repeatable, pairs with --val-masks-dir in order, same "
-                             "--mask-suffix/--mask-ext convention as --images-dir. If given, "
-                             "this EXACT set is used as the validation split (all "
-                             "--images-dir/--masks-dir pairs are used for training) instead "
-                             "of --val-frac's random shuffle - use this to preserve a "
-                             "pre-existing train/val split (e.g. the original paper "
-                             "dataset's separate 'mask' and 'mask_valid' folders).")
+                        help="Fixed validation image directory (repeatable); replaces --val-frac.")
     parser.add_argument("--val-masks-dir", action="append", default=[],
                         help="Mask directory matching --val-images-dir, in order.")
     parser.add_argument("--val-frac", type=float, default=0.2,
-                        help="Fraction of --images-dir/--masks-dir pairs held out for "
-                             "validation via random shuffle (default: 0.2, matching the "
-                             "80/20 split reported for the original segmenter training in "
-                             "Rajendran et al. 2025). Ignored if --val-images-dir is given "
-                             "(use --extra-val-frac instead in that case).")
+                        help="Random validation fraction (default: 0.2, the paper's 80/20 "
+                             "split). Ignored with --val-images-dir.")
     parser.add_argument("--extra-val-frac", type=float, default=0.0,
-                        help="Only relevant together with --val-images-dir: additionally "
-                             "moves this fraction of the (post-overlap) --images-dir training "
-                             "pool into validation via random shuffle, so validation isn't "
-                             "JUST the same small fixed folder on every run (default: 0.0 = "
-                             "off, validate on --val-images-dir alone). E.g. 0.15 adds ~15%% "
-                             "of the training pool on top of the fixed folder - a larger, less "
-                             "noisy validation set makes it much easier to tell whether the "
-                             "model is genuinely overfitting from the training-curve plot "
-                             "(see --no-plot) rather than just bouncing around due to a "
-                             "5-example val set. Uses --seed, so "
-                             "re-running with the same --seed reproduces the same extra split; "
-                             "use a different --seed to get a different one. Ignored if "
-                             "--val-images-dir is not given (--val-frac already covers that "
-                             "case).")
+                        help="With --val-images-dir, also move this fraction of the training "
+                             "pool into validation (default: 0; split depends on --seed).")
     parser.add_argument("--crop-min-scale", type=float, default=0.85,
-                        help="Random-crop augmentation lower bound, as a fraction of the "
-                             "original image/mask size (default: 0.85, i.e. crop between 85%% "
-                             "and 100%% of the frame at a random offset). Approximates the "
-                             "paper's 'random cropping'+'translation' augmentations; set to 1.0 "
-                             "to disable cropping while keeping flip/rotation augmentation.")
+                        help="Smallest random crop as a fraction of the frame (default: 0.85; "
+                             "1.0 disables cropping).")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--loss", choices=["bce", "dice", "bce_dice"], default="bce_dice",
-                        help="Loss function (default: bce_dice - a 50/50 mix, generally more "
-                             "robust to embryo/background class imbalance than BCE alone).")
+                        help="Loss function (default: bce_dice, a 50/50 mix).")
     parser.add_argument("--init-weights", default=DEFAULT_INIT_WEIGHTS,
-                        help="Checkpoint to initialize from for fine-tuning "
-                             f"(default: current production weights at {DEFAULT_INIT_WEIGHTS}).")
+                        help=f"Checkpoint to fine-tune from (default: {DEFAULT_INIT_WEIGHTS}).")
     parser.add_argument("--from-scratch", action="store_true",
                         help="Ignore --init-weights and start from random initialization.")
     parser.add_argument("--skip-connections", action="store_true",
-                        help="Train SegmenterModelSkip (defined in this script) instead of "
-                             "the production SegmenterModel - a U-Net variant with skip "
-                             "connections (see SegmenterModelSkip docstring above and "
-                             "SEGMENTER_ACCURACY_ROADMAP.md Root cause C for rationale/cost). "
-                             "Unless --from-scratch is also given, most of --init-weights "
-                             "transfers directly (see load_compatible_state_dict). "
-                             "run_segmenter_inspect.py auto-detects and loads checkpoints "
-                             "saved with this flag.")
+                        help="Train the U-Net variant SegmenterModelSkip; compatible "
+                             "--init-weights tensors still load.")
     parser.add_argument("--freeze-encoder", action="store_true",
-                        help="Freeze encoder layers (conv1-conv6), fine-tune only the decoder. "
-                             "Recommended if you only have a handful of new corrected examples, "
-                             "to reduce the risk of overfitting/forgetting on the encoder.")
+                        help="Freeze conv1-conv6 and fine-tune only the decoder (good for small data).")
     parser.add_argument("--brightness-correct", action="store_true",
-                        help="Apply automatic_brightness_and_contrast() (the same correction "
-                             "the new inference pipeline applies before segmenting) to every "
-                             "train/val image before augmentation, so training matches "
-                             "inference. Off by default. Requires opencv.")
+                        help="Apply the inference brightness/contrast correction to every "
+                             "image (requires opencv).")
     parser.add_argument("--no-augment", action="store_true",
                         help="Disable train-time augmentation (flips/rotation/brightness jitter).")
     parser.add_argument("--no-plot", action="store_true",
-                        help="Skip writing training_curves.png / training_history.csv to "
-                             "--output-dir at the end of training.")
+                        help="Skip training_curves.png.")
     parser.add_argument("--output-dir", default="EmbryoSegmenter/weights_finetuned",
-                        help="Where to save checkpoints (default: EmbryoSegmenter/weights_finetuned - "
-                             "deliberately NOT the production weights/ dir; promote manually after "
-                             "validating with run_segmenter_inspect.py).")
+                        help="Checkpoint directory (default: EmbryoSegmenter/weights_finetuned).")
     parser.add_argument("--device", default=None, help="cuda / cpu (default: auto-detect).")
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--preview-only", action="store_true",
-                        help="Just discover pairs, write preview overlays, and exit "
-                             "(no training) - use this FIRST to sanity-check alignment.")
+                        help="Only write image/mask preview overlays, then exit.")
     parser.add_argument("--preview-dir", default="preview",
-                        help="Directory for preview overlays (default: ./preview).")
+                        help="Preview output directory (default: preview).")
     parser.add_argument("--preview-n", type=int, default=8)
     args = parser.parse_args()
 
@@ -788,8 +526,7 @@ def main():
     model = model_cls().to(device)
     if args.skip_connections:
         print("Using SegmenterModelSkip (--skip-connections): U-Net variant with skip "
-              "connections, defined in train_segmenter.py - EmbryoSegmenter/SegmenterModel.py "
-              "is unchanged.")
+              "connections.")
 
     if not args.from_scratch:
         if not os.path.exists(args.init_weights):

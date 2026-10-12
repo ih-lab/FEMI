@@ -1,20 +1,10 @@
 """
 labelme_json_to_mask.py
 
-Converts Labelme polygon annotation JSON files into binary mask PNGs in
-the same convention used elsewhere in this repo (see e.g.
-`select_best_contour` in run_segmenter_inspect.py): single-channel
-uint8 PNG, embryo region = 255, background = 0, same width/height as
-the original annotated image (Labelme's `imageWidth`/`imageHeight`
-fields) - NOT resized to the model's 224x224 input size. Resize the
-mask together with its image (using nearest-neighbor, to keep it
-binary) at training/eval time instead of baking a resize in here, so
-mask and image always end up pixel-aligned regardless of what input
-size a given model run uses.
-
-Depends only on Pillow (already a dependency elsewhere in this repo),
-no OpenCV needed. Runs entirely locally - reads/writes only local
-files, no network calls - safe for sensitive images.
+Convert Labelme annotation JSON files into single-channel PNG masks
+(embryo = 255, background = 0) at the annotated image's original size.
+train_segmenter.py and eval_segmenter.py resize masks with their images.
+Needs only Pillow.
 
 Usage:
     python labelme_json_to_mask.py path/to/one.json [more.json ...]
@@ -35,15 +25,8 @@ SUPPORTED_LABELS_HELP = (
 
 
 def polygon_mask_from_labelme(json_path, label=None):
-    """Rasterizes all (or label-matching) polygon/shape point lists in a
-    Labelme JSON file into a single binary mask, at the original
-    imageWidth x imageHeight resolution recorded in the JSON.
-
-    Returns (mask, image_path) where mask is a "L"-mode (uint8) PIL
-    Image with values in {0, 255}, and image_path is the JSON's
-    recorded `imagePath` (for naming the output file after the source
-    image rather than the JSON).
-    """
+    """Fill all (or `label`-matching) shapes into one 0/255 "L" mask at the
+    JSON's imageWidth x imageHeight. Returns (mask, the JSON's imagePath)."""
     with open(json_path, "r") as f:
         data = json.load(f)
 
@@ -61,9 +44,7 @@ def polygon_mask_from_labelme(json_path, label=None):
             (x1, y1), (x2, y2) = points
             draw.rectangle([min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2)], fill=255)
         else:
-            # polygon, circle, line, etc. - filling the raw point list as a
-            # polygon covers Labelme's common shape types well enough here,
-            # since annotation is always a single closed embryo outline.
+            # Other shape types are filled as a polygon of their points.
             draw.polygon(points, fill=255)
 
     return mask, data.get("imagePath")
@@ -93,16 +74,15 @@ def main():
                     "(0/255, single channel), at the annotated image's original resolution.",
         epilog=SUPPORTED_LABELS_HELP,
     )
-    parser.add_argument("jsons", nargs="*", help="One or more Labelme .json annotation files.")
+    parser.add_argument("jsons", nargs="*", help="Labelme .json files.")
     parser.add_argument("--input-dir", default=None,
-                        help="Alternatively (or additionally), convert every .json file in this directory.")
+                        help="Also convert every .json file in this directory.")
     parser.add_argument("--output-dir", default="masks",
-                        help="Directory to write mask PNGs to (default: ./masks).")
+                        help="Mask output directory (default: masks).")
     parser.add_argument("--label", default=None,
-                        help="Only rasterize shapes with this exact label (default: all shapes, unioned).")
+                        help="Only use shapes with this label (default: all shapes).")
     parser.add_argument("--suffix", default="_mask",
-                        help="Suffix appended to the source image's stem for the output filename "
-                             "(default: _mask, e.g. foo.jpg -> foo_mask.png).")
+                        help="Output filename suffix (default: _mask, so foo.jpg -> foo_mask.png).")
     args = parser.parse_args()
 
     json_paths = collect_json_paths(args.jsons, args.input_dir)

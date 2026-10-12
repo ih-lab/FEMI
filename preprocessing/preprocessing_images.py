@@ -17,7 +17,6 @@ weights_dir = 'EmbryoSegmenter/weights_skip/'
 weights_file = weights_dir+'latest.pt'
 model_ft = SegmenterModelSkip()
 model_ft.load_state_dict(torch.load(weights_file, map_location='cpu'))
-model_ft = model_ft.to("cpu")
 model_ft.eval()
 
 print("Segmentation Model loaded.")
@@ -32,7 +31,8 @@ def segment_image(frame):
     select_frames = np.array(select_frames)
     batch = torch.tensor(select_frames)
     batch = batch.float()
-    outputs = model_ft(batch)
+    with torch.no_grad():
+        outputs = model_ft(batch)
     masks = outputs.detach().numpy()
     image = select_frames[0, 0, :, :]
     mask = masks[0, 0, :, :]
@@ -87,10 +87,8 @@ def squarify_bbox(min_x, min_y, max_x, max_y, img_w, img_h):
     return int(new_min_x), int(new_min_y), int(new_max_x), int(new_max_y)
 
 def select_best_contour(mask, max_area_frac=0.9, border_margin=2, min_area_frac=0.1):
-    # Picks one best-candidate contour instead of unioning every contour
-    # above a circularity threshold. Border-touching/oversized contours
-    # (dish rim, vignette) are first discarded; largest remaining area wins,
-    # ties broken by proximity to frame center.
+    # Keeps one contour: prefer ones not touching the border and not oversized
+    # (dish rim, vignette), then the largest, ties broken by closeness to center.
     cv2mask = (mask * 255).astype(np.uint8)
     h, w = cv2mask.shape[:2]
     contours, _ = cv2.findContours(cv2mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -173,15 +171,6 @@ def automatic_brightness_and_contrast(image, clip_hist_percent=10):
         return image
     alpha = 255 / (maximum_gray - minimum_gray)
     beta = -minimum_gray * alpha
-    
-    '''
-    # Calculate new histogram with desired range and show histogram 
-    new_hist = cv2.calcHist([gray],[0],None,[256],[minimum_gray,maximum_gray])
-    plt.plot(hist)
-    plt.plot(new_hist)
-    plt.xlim([0,256])
-    plt.show()
-    '''
 
     auto_result = cv2.convertScaleAbs(image, alpha=alpha, beta=beta)
     return auto_result
@@ -215,6 +204,7 @@ def process_image(image):
 
 start = time.time()
 with concurrent.futures.ProcessPoolExecutor() as executor:
-    results = executor.map(process_image, images)
+    # list() so an exception in any worker is raised here instead of silently dropped.
+    results = list(executor.map(process_image, images))
 end = time.time()
 print("Time taken:", end-start)

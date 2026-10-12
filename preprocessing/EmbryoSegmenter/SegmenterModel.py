@@ -77,10 +77,8 @@ class SegmenterModel(nn.Module):
 
 
 class SegmenterModelSkip(nn.Module):
-    # U-Net variant of SegmenterModel: same encoder, but each decoder stage
-    # concatenates the matching encoder stage's pre-pool feature map (skip
-    # connection) before its conv. Trained via train_segmenter.py
-    # --skip-connections; checkpoints live in EmbryoSegmenter/weights_skip/.
+    # U-Net variant of SegmenterModel: each decoder stage also gets the matching
+    # encoder feature map (skip connection). Weights in EmbryoSegmenter/weights_skip/.
     def __init__(self):
         super(SegmenterModelSkip, self).__init__()
 

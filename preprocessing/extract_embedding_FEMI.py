@@ -6,8 +6,7 @@ Extracts and saves FEMI [CLS] embeddings for the cropped images written by
 embeddings of the same image across pipeline configs. Inference only: the
 pretrained FEMI encoder is never trained or updated.
 
-Expected input layout (eval_segmenter.py's crops/ folder):
-    {crops_dir}/{config}/{dataset}/{image}
+Input layout: {crops_dir}/{config}/{dataset}/{image}
 
 Run from preprocessing/ with the FEMI environment:
     python extract_embedding_FEMI.py
@@ -15,34 +14,21 @@ Run from preprocessing/ with the FEMI environment:
     python extract_embedding_FEMI.py --configs A,C --overwrite
     python extract_embedding_FEMI.py --configs A,B --save_format both
 
-Outputs:
-    {output_dir}/{config}/embeddings.npy   shape (N, 1024)              [--save_format npy/both]
-    {output_dir}/{config}/vectors.tsv       N lines, tab-separated      [--save_format tsv/both]
-    {output_dir}/{config}/labels.tsv        N labels, same order        [--save_format tsv/both]
-    {output_dir}/{config}/index.csv         N rows: config, dataset, image, filepath
-    {output_dir}/pairwise_similarity.csv    one row per (image, config pair)
-    {output_dir}/summary.csv                one row per config pair
-    {output_dir}/femi_similarity_summary.png   mean +/- std cosine per config pair,
-                                               with every image as a dot
-    {output_dir}/femi_similarity_heatmap.png   per-image cosine, images x config pairs
-    {output_dir}/femi_embedding_pca.png        2D PCA of all embeddings, colored by
-                                               config, same image joined by a line
+Outputs in {output_dir}:
+    {config}/index.csv              config, dataset, image, filepath per row
+    {config}/embeddings.npy         (N, 1024)            [--save_format npy/both]
+    {config}/vectors.tsv, labels.tsv                     [--save_format tsv/both]
+    pairwise_similarity.csv, summary.csv   cosine/L2 per image and per config pair
+    femi_similarity_summary.png, femi_similarity_heatmap.png, femi_embedding_pca.png
 
-vectors.tsv and labels.tsv are the inputs of the Embedding Comparator's
-preprocess_data.py (embedding-comparator/), one model per config:
-    python preprocess_data.py --embeddings_file={config}/vectors.tsv \
-        --metadata_file={config}/labels.tsv --outfile=... --max_k=100
-Labels drop the extension and focal-plane suffix
-(10080161_0335_110.2_M_0.jpg -> 10080161_0335_110.2_M). The comparator needs
-identical labels in identical order across the models it compares; a warning
-is logged when configs differ.
+vectors.tsv/labels.tsv feed the Embedding Comparator's preprocess_data.py, one
+model per config. Labels drop the extension and focal-plane suffix
+(10080161_0335_110.2_M_0.jpg -> 10080161_0335_110.2_M) and must match across
+configs; a warning is logged if they don't.
 
-Resumable: if a config's embeddings already exist in either format,
-extraction is skipped for it unless --overwrite is passed; any format asked
-for by --save_format that is missing is written from the saved embeddings
-(the comparison and plots are always rerun, and FEMI is only loaded if
-something needs extracting).
-Plots need matplotlib; without it the CSVs are still written.
+Resumable: configs with saved embeddings are skipped unless --overwrite;
+missing --save_format files are rebuilt from what's saved. The comparison and
+plots always rerun. Plots need matplotlib.
 """
 
 from __future__ import annotations

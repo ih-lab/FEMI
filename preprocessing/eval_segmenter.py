@@ -1,158 +1,65 @@
 """
 eval_segmenter.py
 
-Quantitative benchmarking for `EmbryoSegmenter/SegmenterModel.py` (and its
-`SegmenterModelSkip` U-Net variant from `train_segmenter.py`), at two levels:
+Benchmarks the embryo segmenter (`SegmenterModel` and `SegmenterModelSkip`).
 
-  --mode model (default): raw CNN mask quality for one or more checkpoints -
-      Dice, IoU, Hausdorff/HD95, a probability-threshold sweep, and
-      pixel-probability calibration. This is the "is the network's output
-      itself accurate" question - see the original module docstring section
-      below for detail. Unchanged from this script's first version.
+Modes:
+  model (default)  raw network mask quality per checkpoint: Dice, IoU,
+                   HD/HD95, a threshold sweep, and pixel calibration (ECE, Brier).
+  pipeline         end-to-end comparison of the configs in CONFIG_TYPES
+                   (model + contour selection + crop) against labeled masks.
+                   Tier 1 = raw mask, Tier 2 = mask after contour selection,
+                   Tier 3 = crop box vs. ground truth; plus failure rates,
+                   latency, and model size.
+  crops            run configs on unlabeled images and save only the crops
+                   plus a diagnostics manifest.
 
-  --mode pipeline: full END-TO-END preprocessing-pipeline comparison - model
-      + contour-selection/fallback logic + final crop geometry - across
-      named pipeline "configs" that mirror this repo's actual, divergent
-      implementations:
-        A       the previous production pipeline (circularity>0.7 contour union,
-                conditional brightness-retry, direct/"warp" crop). Kept here
-                for comparison; `preprocessing_images.py` no longer runs it.
-        B       the pipeline now in `preprocessing_images.py`, with the
-                CURRENT production weights: new contour logic + squarify crop.
-        C       the full new pipeline with the NEW `SegmenterModelSkip`
-                weights (`train_segmenter.py --skip-connections`).
-      Reports mask quality (Tier 1: raw network output; Tier 2: after
-      contour-selection - the mask actually used to crop) AND crop-level
-      metrics (Tier 3: bounding-box IoU vs. ground truth, embryo recall
-      inside the predicted box, centroid error, crop-area fraction) plus
-      failure-mode/deployability rates (full-image fallback, border-touch,
-      possible dish/vignette false positive, visible aspect-ratio
-      distortion), per-image end-to-end latency (mean/std/p50/p95,
-      throughput), and model storage (parameter count, checkpoint file
-      size, in-memory RAM footprint) - see `run_pipeline_mode()` below.
+Configs:
+  A  previous production pipeline: circularity>0.7 contour union,
+     brightness retry only if empty, direct (warp) crop; production weights.
+  B  new pipeline (select_best_contour, brightness first, squarify crop);
+     production weights.
+  C  same as B with SegmenterModelSkip weights; this is what
+     preprocessing_images.py runs.
 
-Both modes use low-level pipeline primitives defined in THIS file
-(`load_model`, `load_image`, `segment_image`, `calculate_circularity`,
-`automatic_brightness_and_contrast`, `find_bounding_box`,
-`select_best_contour`, `squarify_bbox`). `run_segmenter_inspect.py` imports
-them from here. `preprocessing_images.py` is a separate, self-contained
-batch script and keeps its own copies — it is not imported here, because
-that file loads a model, lists a directory, and starts a ProcessPoolExecutor
-at import time. Config A's circularity-union filter
-(`filter_mask_by_circularity_union`) is the previous production behavior,
-kept in this file for the benchmark only.
+The pipeline primitives live in this file and are imported by
+run_segmenter_inspect.py. preprocessing_images.py keeps its own copies so it
+runs on its own.
 
-Reuses this repo's existing conventions rather than reinventing them:
-  - Pair discovery (--mode model): `discover_pairs()` from `train_segmenter.py`
-    (same filename-stem matching, same `--mask-suffix`/`--mask-ext` semantics).
-  - Pair discovery (--mode pipeline): a dataset-tagged variant of the same
-    idea (`collect_labeled_pairs_with_dataset_tags`) that keeps every
-    source's pairs distinct instead of merging/overriding by stem, since for
-    evaluation (unlike training) we want to report on every source
-    separately, not silently drop overlapping stems.
-  - Image/mask resizing: same as `SegmentationDataset` in `train_segmenter.py`
-    (image: bilinear, mask: nearest, resized together to the model's fixed
-    224x224 input/output size). All pixel-distance metrics (Hausdorff/HD95,
-    bbox coordinates, centroid distance) are therefore in 224x224-pixel
-    units, not the original annotated image's resolution.
-  - Dice/IoU formula: identical to `dice_iou_at_threshold()` in
-    `train_segmenter.py` (same epsilon, same definition).
+All images and masks are resized to 224x224, so pixel metrics are in
+224x224 units.
 
---mode pipeline data sources: by default, ALL FOUR of this repo's labeled
-sets, tagged by dataset in the output so you can check whether a config's
-ranking holds up consistently across sources (and so you can spot
-optimistic bias if a checkpoint was trained on one of them - see the
-caution message printed at the end of a pipeline run):
-  old_train   preprocessing/mask/psd (raw) + preprocessing/mask/Embryo (mask)
-              - the original paper's 30-pair dataset (mask named identically
-              to the image, e.g. "foo.jpg" raw + "foo.jpg" mask).
-  old_valid   preprocessing/mask_valid/psd + preprocessing/mask_valid/Embryo
-              - that dataset's held-out validation split.
-  new_labels  preprocessing/new_labels/raw_images + preprocessing/new_labels/masks
-              - this repo's newer Labelme-annotated set
-              (labelme_json_to_mask.py convention: "foo.jpg" + "foo_mask.png").
-  new_valid   preprocessing/new_valid/raw_images + preprocessing/new_valid/mask_valid
-              - held-out validation set for new train_segmenter.py runs
-              (same naming as new_labels). Checkpoints trained with it as
-              --val-images-dir never saw it, so its per-dataset numbers are
-              the fairest comparison. Note one image
-              (42256795_0397_133.9_B_0) is also in old_train, so the
-              production weights have seen that one.
+Default pipeline sources (each reported separately):
+  old_train   mask/psd + mask/Embryo                  (original paper data)
+  old_valid   mask_valid/psd + mask_valid/Embryo
+  new_labels  new_labels/raw_images + new_labels/masks (Labelme, "_mask.png")
+  new_valid   new_valid/raw_images + new_valid/mask_valid
+Checkpoints trained on a source score optimistically on it; new_valid is
+the fairest comparison (one of its images, 42256795_0397_133.9_B_0, is
+also in old_train).
 
-Usage:
-    cd preprocessing
-
-    # --mode model (default): evaluate production weights on new_labels/:
+Usage (from preprocessing/):
     python eval_segmenter.py
-
-    # --mode model: compare production vs. a fine-tuned/skip-connection checkpoint:
     python eval_segmenter.py \\
         --weights EmbryoSegmenter/weights/epoch_102_loss_0.098710.pt --weights-name production \\
         --weights EmbryoSegmenter/weights_skip/latest.pt --weights-name skip_connections
-
-    # --mode pipeline: benchmark all 3 configs (A, B, C) across all 4
-    # default labeled sources:
-    python eval_segmenter.py --mode pipeline
-
-    # --mode pipeline: only production vs. the full new pipeline with the
-    # new model, on just the new_labels/ set:
-    python eval_segmenter.py --mode pipeline --configs A,C \\
-        --images-dir new_labels/raw_images --masks-dir new_labels/masks \\
-        --mask-suffix _mask --mask-ext .png
-
-    # --mode crops: no masks needed - run configs A/B/C on an unlabeled
-    # folder and only save the crops (+ crop_manifest.csv diagnostics):
-    python eval_segmenter.py --mode crops --configs A,B,C \\
-        --images-dir ../extracted_110-111h_focal0 \\
-        --output-dir segmenter_crops_output/extracted_110-111h_focal0
-
-    # --mode pipeline: same benchmark on new_valid/, and also write each
-    # config's final 224x224 crop to crops/<config>/<dataset>/:
+    python eval_segmenter.py --mode pipeline --configs A,B,C
     python eval_segmenter.py --mode pipeline --configs A,B,C \\
         --images-dir new_valid/raw_images --masks-dir new_valid/mask_valid \\
-        --mask-suffix _mask --mask-ext .png\\
-        --save-crops --output-dir segmenter_pipeline_eval_output/
+        --mask-suffix _mask --mask-ext .png --save-crops
+    python eval_segmenter.py --mode crops --configs A,C \\
+        --images-dir ../extracted_110-111h_focal0
 
-Outputs (written to --output-dir):
-  --mode model (default dir: ./segmenter_eval_output):
-    per_image_metrics.csv   one row per (model, image): dice, iou, hd, hd95 @ --threshold
-    threshold_sweep.csv     one row per (model, threshold): mean dice/iou/hd95
-    calibration_bins.csv    one row per (model, probability bin): mean_pred, empirical_frac, count
-    summary.csv             one row per model: headline numbers @ --threshold, best threshold, ECE, Brier
-    threshold_sweep.png     Dice/IoU/HD95 vs. threshold, one line per model
-    calibration.png         reliability diagram, one curve per model
-    benchmark_dice_iou.png  headline benchmark figure: mean Dice/IoU +/- std per model (bar chart)
-    per_image_dice_iou.png  per-image Dice/IoU distributions per model (box plot)
+Outputs (in --output-dir):
+  model:    per_image_metrics.csv, threshold_sweep.csv, calibration_bins.csv,
+            summary.csv, and threshold_sweep/calibration/benchmark_dice_iou/
+            per_image_dice_iou .png
+  pipeline: pipeline_per_image_metrics.csv, pipeline_summary.csv,
+            pipeline_resources.csv, matching .png plots, and with
+            --save-crops, crops/<config>/<dataset>/
+  crops:    crops/<config>/<dataset>/ and crop_manifest.csv
 
-  --mode pipeline (default dir: ./segmenter_pipeline_eval_output):
-    pipeline_per_image_metrics.csv  one row per (dataset, config, image): all tiers
-    pipeline_summary.csv            one row per (dataset, config) incl. "ALL" (combined)
-    pipeline_dice_iou.png           Tier-2 (post-contour) Dice/IoU +/- std per config
-    pipeline_bbox_metrics.png       bbox IoU + embryo recall-in-bbox per config
-    pipeline_failure_rates.png      fallback/border-touch/bg-FP/distortion rates per config
-    pipeline_per_image_dice_iou.png per-image Tier-2 Dice/IoU distributions (box plot)
-    pipeline_dice_by_dataset.png    Tier-2 Dice per config, broken out by dataset source
-    pipeline_resources.csv          one row per config: timing (mean/std/p50/p95, throughput)
-                                    + storage (parameter count, checkpoint file size MB,
-                                    in-memory model footprint MB)
-    pipeline_resources.png          3-panel deployability figure: latency, throughput,
-                                    model storage (params + checkpoint + RAM)
-    pipeline_latency_box.png        per-image end-to-end latency distribution per config
-    crops/<config>/<dataset>/      only with --save-crops: one folder per
-                                    pipeline config, each holding that
-                                    config's final 224x224 crop (original
-                                    filename). A is the warp crop; B and C
-                                    are the squarified crop.
-
-  --mode crops (default dir: ./segmenter_crops_output):
-    crops/<config>/<dataset>/       each config's final 224x224 crop (original filename)
-    crop_manifest.csv               one row per (dataset, config, image): bbox, crop area,
-                                    border/background/distortion/fallback flags
-
-No new dependencies: only numpy/torch/opencv/pillow (already required by
-EmbryoSegmenter/requirements-segmenter.txt) plus matplotlib for plots (also
-already listed there; if missing, CSVs are still written and only plots
-are skipped).
+Plots are skipped (CSVs still written) if matplotlib isn't installed.
 """
 
 import argparse
@@ -167,8 +74,8 @@ import numpy as np
 import torch
 from PIL import Image
 
-from EmbryoSegmenter.SegmenterModel import SegmenterModel
-from train_segmenter import IMAGE_EXTS, SegmenterModelSkip, _expand_per_pair, discover_pairs
+from EmbryoSegmenter.SegmenterModel import SegmenterModel, SegmenterModelSkip
+from train_segmenter import IMAGE_EXTS, _expand_per_pair, discover_pairs
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_IMAGES_DIR = os.path.join(SCRIPT_DIR, "new_labels", "raw_images")
@@ -176,7 +83,7 @@ DEFAULT_MASKS_DIR = os.path.join(SCRIPT_DIR, "new_labels", "masks")
 DEFAULT_WEIGHTS = os.path.join(SCRIPT_DIR, "EmbryoSegmenter", "weights", "epoch_102_loss_0.098710.pt")
 DEFAULT_SKIP_WEIGHTS = os.path.join(SCRIPT_DIR, "EmbryoSegmenter", "weights_skip", "latest.pt")
 
-# --mode pipeline's default data sources - see module docstring.
+# --mode pipeline's default sources: (name, images_dir, masks_dir, mask_suffix, mask_ext).
 DEFAULT_PIPELINE_SOURCES = [
     ("old_train", os.path.join(SCRIPT_DIR, "mask", "psd"), os.path.join(SCRIPT_DIR, "mask", "Embryo"), "", ".jpg"),
     ("old_valid", os.path.join(SCRIPT_DIR, "mask_valid", "psd"), os.path.join(SCRIPT_DIR, "mask_valid", "Embryo"), "", ".jpg"),
@@ -185,20 +92,12 @@ DEFAULT_PIPELINE_SOURCES = [
      os.path.join(SCRIPT_DIR, "new_valid", "mask_valid"), "_mask", ".png"),
 ]
 
-# --mode pipeline / --mode crops: each config is one combination of the
-# pipeline's interchangeable steps, all run by `run_pipeline_config()`:
-#   weights_arg  which CLI option holds the checkpoint path ("prod_weights"
-#                or "skip_weights"); the architecture is auto-detected by
-#                `load_model()`, so only the path is needed here.
-#   brightness   "none" (segment the raw image), "always" (brightness-correct
-#                first, one forward pass), or "retry_if_empty" (segment the
-#                raw image, and only if the filtered mask is empty retry once
-#                on a brightness-corrected copy).
-#   contour      "circularity_union" (`filter_mask_by_circularity_union`) or
-#                "select_best_contour".
-#   crop_style   "warp" (crop the raw box and force-resize) or "squarify"
-#                (`squarify_bbox` first) - see `render_pipeline_crop`.
-# To add a config, add an entry here; nothing else needs to change.
+# Pipeline configs, run by `run_pipeline_config()`. Add an entry to add a config.
+#   weights_arg  CLI option holding the checkpoint ("prod_weights" or "skip_weights")
+#   brightness   "none", "always" (correct first), or "retry_if_empty"
+#                (retry on a corrected copy only if the filtered mask is empty)
+#   contour      "circularity_union" or "select_best_contour"
+#   crop_style   "warp" (crop the raw box) or "squarify" (square it first)
 CONFIG_TYPES = {
     "A": {
         "description": "previous production pipeline: circularity>0.7 contour union, "
@@ -209,7 +108,7 @@ CONFIG_TYPES = {
         "crop_style": "warp",
     },
     "B": {
-        "description": "preprocessing_images.py pipeline, production weights: "
+        "description": "new pipeline, production weights: "
                        "select_best_contour + always-brightness-first + squarify crop",
         "weights_arg": "prod_weights", 
         "brightness": "always",
@@ -217,8 +116,8 @@ CONFIG_TYPES = {
         "crop_style": "squarify",
     },
     "C": {
-        "description": "new pipeline, NEW model: select_best_contour + always-brightness-first "
-                       "+ squarify crop; SegmenterModelSkip weights",
+        "description": "new pipeline, NEW model (preprocessing_images.py): select_best_contour "
+                       "+ always-brightness-first + squarify crop; SegmenterModelSkip weights",
         "weights_arg": "skip_weights", 
         "brightness": "always",
         "contour": "select_best_contour", 
@@ -227,26 +126,12 @@ CONFIG_TYPES = {
 }
 
 # ---------------------------------------------------------------------------
-# Shared low-level pipeline primitives (moved from run_segmenter_inspect.py -
-# see that file's updated docstring. Behavior is unchanged; only the module
-# they live in changed).
+# Pipeline primitives (also imported by run_segmenter_inspect.py)
 # ---------------------------------------------------------------------------
 
 def load_model(weights_path):
-    """
-    Load a segmenter checkpoint, auto-detecting whether it's the production
-    `SegmenterModel` architecture or the `SegmenterModelSkip` (U-Net, skip
-    connections) variant trained via `train_segmenter.py --skip-connections`
-    - see that file for the SegmenterModelSkip class itself
-    (`EmbryoSegmenter/SegmenterModel.py` has no skip-connection variant, by
-    design). The two are distinguished by `deconv4.conv.weight`'s input
-    channel count (256 = no skip, 512 = skip, since skip connections
-    concatenate deconv5's 256-channel output with conv5's 256-channel
-    feature map). Auto-detecting means callers don't need to track which
-    architecture a given .pt file was trained with. Always loads to CPU
-    (map_location="cpu") and calls .eval() - matches production and
-    run_segmenter_inspect.py, which never move this model off CPU.
-    """
+    """Load a checkpoint on CPU in eval mode, picking `SegmenterModel` or
+    `SegmenterModelSkip` from deconv4's input channels (256 vs. 512)."""
     state_dict = torch.load(weights_path, map_location="cpu")
     try:
         deconv4_in_channels = state_dict["deconv4.conv.weight"].shape[1]
@@ -269,23 +154,14 @@ def load_model(weights_path):
 
 
 def load_image(image_path, size=(224, 224)):
-    """Same behavior as `load_image` in preprocessing_images.py: open,
-    resize to a fixed size, and convert to a numpy array (whatever mode
-    the source image is in - grayscale or RGB), with RAW pixel values
-    (0-255ish), NOT normalized. This is the convention `segment_image()`/
-    `automatic_brightness_and_contrast()` below expect."""
+    """Open and resize to `size`; raw 0-255 values, not normalized."""
     img = Image.open(image_path)
     img = img.resize(size)
     return np.array(img)
 
 
 def segment_image(model, frame):
-    """Same behavior as `segment_image` in preprocessing_images.py: one
-    forward pass through SegmenterModel/SegmenterModelSkip, thresholded at
-    0.5. Returns just the binary (0.0/1.0 float) mask - this repo's
-    production code never uses the discarded pixel-masked
-    `segmented_images` output either (see SEGMENTER_ACCURACY_ROADMAP.md
-    Section 1)."""
+    """One forward pass, thresholded at 0.5. Returns the 0.0/1.0 float mask."""
     frame = frame / 255.0
     if len(frame.shape) > 2:
         frame = frame[:, :, 0]
@@ -301,12 +177,7 @@ def segment_image(model, frame):
 
 
 def calculate_circularity(contour):
-    """Isoperimetric-style formula: 4*pi*Area/Perimeter^2 (1.0 for a perfect
-    circle). Used as a hard filter by config A
-    (`filter_mask_by_circularity_union`) — the only place left that runs
-    config A's logic, now that `preprocessing_images.py` runs config B/C.
-    Also reported purely as a diagnostic in `run_segmenter_inspect.py`,
-    which does not use it to select/reject contours."""
+    """4*pi*Area/Perimeter^2 (1.0 for a perfect circle)."""
     area = cv2.contourArea(contour)
     perimeter = cv2.arcLength(contour, True)
     if perimeter == 0:
@@ -315,9 +186,8 @@ def calculate_circularity(contour):
 
 
 def automatic_brightness_and_contrast(image, clip_hist_percent=10):
-    """Identical to preprocessing_images.py: clip a percentage of the
-    darkest/lightest pixels (via the cumulative grayscale histogram) and
-    linearly stretch the remaining range to fill [0, 255]."""
+    """Clip `clip_hist_percent` of the darkest/lightest pixels and stretch
+    the rest to [0, 255]."""
     if len(image.shape) == 2:
         gray = image
     elif len(image.shape) == 3:
@@ -326,8 +196,7 @@ def automatic_brightness_and_contrast(image, clip_hist_percent=10):
     hist = cv2.calcHist([gray], [0], None, [256], [0, 256])
     hist_size = len(hist)
 
-    # float(hist[index]) below triggers a harmless NumPy scalar-conversion
-    # DeprecationWarning; silenced locally so it doesn't affect callers.
+    # float(hist[i]) raises a harmless NumPy DeprecationWarning.
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", category=DeprecationWarning)
         accumulator = [float(hist[0])]
@@ -355,8 +224,7 @@ def automatic_brightness_and_contrast(image, clip_hist_percent=10):
 
 
 def find_bounding_box(mask):
-    """Identical to preprocessing_images.py: returns (min_x, min_y, max_x,
-    max_y), or the full-frame box if the mask has no foreground pixels."""
+    """(min_x, min_y, max_x, max_y) of the mask, or the full frame if empty."""
     if np.sum(mask) == 0:
         return (0, 0, mask.shape[1], mask.shape[0])
     rows = np.any(mask, axis=1)
@@ -368,32 +236,13 @@ def find_bounding_box(mask):
 
 def select_best_contour(mask, max_area_frac=0.9, border_margin=2, min_area_frac=0.1):
     """
-    Fixed replacement for production's circularity-union filter (root
-    causes A/B in SEGMENTER_ACCURACY_ROADMAP.md; see
-    `filter_mask_by_circularity_union` below for the production logic this
-    replaces). Instead of taking the UNION of every contour whose
-    *circularity* clears a hard threshold, this picks a SINGLE
-    best-candidate contour, and does not use circularity at all:
-
-      0. Discard contours smaller than `min_area_frac` of the frame before
-         anything else - a cheap noise-speck guard (see
-         SEGMENTER_ACCURACY_ROADMAP.md Root cause B for why this has to run
-         before step 2, not after).
-      1. Find all remaining external contours in the raw thresholded mask.
-      2. Prefer contours that (a) do NOT touch/nearly touch the image
-         border, and (b) are not implausibly large (> `max_area_frac` of
-         the frame) - a petri dish rim or light vignette almost always
-         trips one of these checks, while a real embryo (even off-center,
-         even non-circular) usually trips neither.
-      3. Among the surviving candidates (or, if none survive, among ALL
-         candidates), choose the one with the LARGEST area, breaking ties
-         by proximity to the frame center.
-      4. Draw ONLY that one contour (filled) onto the output mask - no
-         union with any other contour.
-
-    Returns (final_mask, selected_contour) where final_mask matches the
-    input mask's shape/dtype convention (float, 0.0/1.0) and
-    selected_contour is None if no contour was found at all.
+    Keep a single contour instead of a circularity union:
+      1. drop contours under `min_area_frac` of the frame (noise specks);
+      2. prefer ones that don't touch the border (within `border_margin`)
+         and aren't over `max_area_frac` of the frame (dish rim, vignette);
+      3. take the largest, breaking ties by closeness to the center.
+    Falls back to the full candidate list whenever a filter removes everything.
+    Returns (float 0.0/1.0 mask, contour), with contour None if none found.
     """
     cv2mask = (mask * 255).astype(np.uint8)
     h, w = cv2mask.shape[:2]
@@ -442,15 +291,8 @@ def select_best_contour(mask, max_area_frac=0.9, border_margin=2, min_area_frac=
 
 
 def squarify_bbox(min_x, min_y, max_x, max_y, img_w, img_h):
-    """
-    Expand a (possibly non-square) bounding box into a square box of side
-    `max(width, height)`, centered on the original box's center, then
-    shift it (without resizing) so it stays fully within the image bounds.
-
-    Cropping a SQUARE region first means the final resize to 224x224 is
-    uniform, with no distortion - fixes root cause F in
-    SEGMENTER_ACCURACY_ROADMAP.md.
-    """
+    """Grow the box to a centered square of side max(w, h), shifted to stay
+    inside the image, so the 224x224 resize doesn't distort the embryo."""
     box_w = max_x - min_x
     box_h = max_y - min_y
     side = max(box_w, box_h)
@@ -471,13 +313,8 @@ def squarify_bbox(min_x, min_y, max_x, max_y, img_w, img_h):
 
 
 def filter_mask_by_circularity_union(mask, min_circularity=0.7):
-    """
-    The previous production contour filter (config A): keep every contour
-    whose circularity exceeds `min_circularity` and draw the UNION of all
-    of them. `preprocessing_images.py` no longer does this — it uses
-    `select_best_contour` — so this stays here only so the benchmark can
-    still compare against that older behavior.
-    """
+    """Config A's contour filter: union of every contour with circularity >
+    `min_circularity`. Kept only for benchmarking."""
     cv2mask = (mask * 255).astype(np.uint8)
     contours, _ = cv2.findContours(cv2mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     circular_contours = [cnt for cnt in contours if calculate_circularity(cnt) > min_circularity]
@@ -491,8 +328,7 @@ def filter_mask_by_circularity_union(mask, min_circularity=0.7):
 # ---------------------------------------------------------------------------
 
 def apply_contour_filter(contour, raw_mask, args):
-    """Run the contour step named by a config's "contour" entry. Returns the
-    filtered mask (float, 0.0/1.0)."""
+    """Run a config's "contour" step; returns the filtered 0.0/1.0 mask."""
     if contour == "circularity_union":
         return filter_mask_by_circularity_union(raw_mask, args.circularity_threshold)
     if contour == "select_best_contour":
@@ -502,21 +338,10 @@ def apply_contour_filter(contour, raw_mask, args):
     raise ValueError(f"Contour function {contour!r} not supported")
 
 
-
-
-
 def render_pipeline_crop(img, result, out_size=(224, 224)):
-    """The 224x224 image this config would write for `img`.
-
-    Config A (`crop_style="warp"`) slices the raw box and force-resizes,
-    matching the previous production crop: `find_bounding_box` returns
-    inclusive corners, and the slice treats them as an exclusive end.
-    Configs B and C (`crop_style="squarify"`) expand that box to a square
-    with `squarify_bbox` first, then resize, matching
-    `preprocessing_images.py` and `run_segmenter_inspect.py`. The crop is
-    taken from the original (already 224x224) frame, not the
-    brightness-adjusted copy the segmenter saw.
-    """
+    """The 224x224 crop a config would write, cut from the original (not
+    brightness-adjusted) frame. "warp" slices the raw box directly;
+    "squarify" squares it first."""
     min_x, min_y, max_x, max_y = result["bbox"]
     h, w = img.shape[0], img.shape[1]
     if result["crop_style"] == "squarify":
@@ -541,9 +366,8 @@ def save_pipeline_crop(img, result, out_dir, filename):
 # ---------------------------------------------------------------------------
 
 def load_image_mask(image_path, mask_path, size=(224, 224)):
-    """--mode model's loader: mirrors SegmentationDataset in
-    train_segmenter.py (minus augmentation). Returns the image NORMALIZED
-    to [0, 1] (as `predict_prob` expects), unlike `load_image` above."""
+    """--mode model loader, matching SegmentationDataset without augmentation.
+    Returns the image normalized to [0, 1] and a binary mask."""
     img = Image.open(image_path).convert("L")
     mask = Image.open(mask_path).convert("L")
     if img.size != mask.size:
@@ -556,21 +380,13 @@ def load_image_mask(image_path, mask_path, size=(224, 224)):
 
 
 def load_gt_mask(mask_path, size=(224, 224)):
-    """--mode pipeline's ground-truth-mask loader: nearest-neighbor resize
-    (to stay binary) + threshold at 127, same convention as
-    `load_image_mask` above and `labelme_json_to_mask.py`. Kept separate
-    from `load_image_mask` because pipeline mode loads the raw image via
-    `load_image` (unnormalized, matching segment_image()'s expectations)
-    rather than the [0, 1]-normalized array `load_image_mask` produces."""
+    """--mode pipeline ground truth: nearest-neighbor resize, threshold at 127."""
     mask = Image.open(mask_path).convert("L").resize(size, Image.NEAREST)
     return np.asarray(mask, dtype=np.float32) > 127
 
 
 def predict_prob(model, img_arr, device="cpu"):
-    """--mode model's forward pass, returning the raw (pre-threshold)
-    224x224 probability map - same forward pass as `segment_image()`,
-    just without the threshold applied, since the threshold-sweep and
-    calibration-curve metrics need the full probability surface."""
+    """Unthresholded probability map, for the threshold sweep and calibration."""
     x = torch.from_numpy(img_arr).float().unsqueeze(0).unsqueeze(0).to(device)
     with torch.no_grad():
         out = model(x)
@@ -579,15 +395,10 @@ def predict_prob(model, img_arr, device="cpu"):
 
 def collect_labeled_pairs_with_dataset_tags(sources):
     """
-    --mode pipeline's pair collector. `sources` is a list of
-    (dataset_name, images_dir, masks_dir, mask_suffix, mask_ext) tuples.
-    Returns a flat list of (dataset_name, stem, image_path, mask_path) -
-    ALL matched pairs from ALL sources, each tagged with its source. This
-    deliberately does NOT merge/override by stem the way
-    `train_segmenter.discover_pairs` does (that behavior is right for
-    TRAINING - "replace old inaccurate masks with corrected ones" - but
-    wrong for evaluation, where we want every source's images visible and
-    separately reportable, even if two sources happened to share a stem).
+    `sources`: (dataset_name, images_dir, masks_dir, mask_suffix, mask_ext)
+    tuples. Returns (dataset_name, stem, image_path, mask_path) for every
+    match. Unlike `discover_pairs`, shared stems are not merged, so every
+    source is reported separately.
     """
     all_pairs = []
     for dataset_name, images_dir, masks_dir, mask_suffix, mask_ext in sources:
@@ -615,9 +426,7 @@ def collect_labeled_pairs_with_dataset_tags(sources):
 # ---------------------------------------------------------------------------
 
 def dice_iou_numpy(pred_bin, gt_bin, eps=1e-6):
-    """Identical formula to `dice_iou_at_threshold()` in
-    train_segmenter.py (same epsilon), just operating on a single
-    already-binarized numpy mask pair instead of a torch batch."""
+    """Same formula as train_segmenter.dice_iou_at_threshold, for one numpy pair."""
     pred_bin = pred_bin.astype(np.float64).ravel()
     gt_bin = gt_bin.astype(np.float64).ravel()
     intersection = float((pred_bin * gt_bin).sum())
@@ -629,9 +438,7 @@ def dice_iou_numpy(pred_bin, gt_bin, eps=1e-6):
 
 
 def _border_mask(mask_bool):
-    """3x3-connectivity boundary (outer ring) of a binary mask, via
-    erosion. Uses cv2 (already a hard dependency of this repo) rather
-    than adding scipy just for `binary_erosion`/`distance_transform_edt`."""
+    """Boundary pixels of a binary mask (mask minus its 3x3 erosion)."""
     if not mask_bool.any():
         return mask_bool.copy()
     mask_u8 = mask_bool.astype(np.uint8) * 255
@@ -641,36 +448,16 @@ def _border_mask(mask_bool):
 
 
 def _distance_map_to(border_bool):
-    """Per-pixel Euclidean distance to the nearest True pixel of
-    `border_bool`, via cv2.distanceTransform (which measures distance to
-    the nearest ZERO pixel - so border pixels are set to 0, everything
-    else to 255, before calling it)."""
+    """Per-pixel distance to the nearest True pixel of `border_bool`."""
+    # cv2.distanceTransform measures distance to the nearest ZERO pixel.
     src = np.where(border_bool, 0, 255).astype(np.uint8)
     return cv2.distanceTransform(src, cv2.DIST_L2, 5)
 
 
 def hausdorff_distances(pred_bin, gt_bin, percentile=95.0):
-    """
-    Returns (hd, hd_p): the full (100th-percentile/max) Hausdorff distance
-    and the `percentile`-th percentile Hausdorff distance (HD95 when
-    percentile=95, the default), both in pixels at whatever resolution the
-    input masks are (224x224 for this script - see module docstring).
-
-    Computed the standard symmetric way used in medical-image segmentation
-    benchmarks (e.g. MONAI/medpy): for every boundary pixel of the
-    prediction, find its distance to the nearest boundary pixel of the
-    ground truth (and vice versa); HD is the max over the union of both
-    directed distance sets, HD95 is the max of the two directed
-    95th-percentiles.
-
-    Why HD95 in addition to raw HD: HD is extremely sensitive to a single
-    outlier pixel. HD95 discards the worst 5% of boundary distances before
-    taking the max, which is far more representative of overall boundary
-    quality.
-
-    Returns (None, None) if either mask is entirely empty - Hausdorff
-    distance is undefined in that case.
-    """
+    """Symmetric boundary Hausdorff distance (max) and its `percentile`-th
+    percentile (HD95 by default), in pixels. (None, None) if either mask is
+    empty."""
     if not pred_bin.any() or not gt_bin.any():
         return None, None
 
@@ -694,14 +481,8 @@ def hausdorff_distances(pred_bin, gt_bin, percentile=95.0):
 
 
 def reliability_diagram(all_probs, all_gts, n_bins=10):
-    """
-    --mode model only. Bins every pixel's predicted probability into
-    `n_bins` equal-width bins over [0, 1], and for each bin reports the
-    mean predicted probability, the empirical fraction of those pixels
-    that are actually embryo, and the pixel count. Also returns ECE
-    (Expected Calibration Error) and Brier score - see original docstring
-    detail preserved from this script's first version.
-    """
+    """Bin pixel probabilities into `n_bins`; per bin, mean prediction vs.
+    fraction actually embryo. Returns (rows, ECE, Brier score)."""
     probs = all_probs.ravel()
     targets = all_gts.ravel()
     n_total = probs.size
@@ -746,11 +527,7 @@ def bbox_iou(box_a, box_b):
 
 
 def embryo_recall_in_bbox(gt_mask_bool, box):
-    """Fraction of ground-truth embryo pixels that fall inside `box` -
-    directly answers "did this crop lose part of the embryo?" (a failure
-    mode Dice/IoU on the mask alone doesn't cleanly capture, since it's
-    about the CROP, not the mask). Returns None if the GT mask is empty
-    (shouldn't happen with real annotations, but guarded defensively)."""
+    """Fraction of ground-truth embryo pixels inside `box` (None if GT is empty)."""
     x0, y0, x1, y1 = box
     h, w = gt_mask_bool.shape
     x0, y0 = max(0, int(x0)), max(0, int(y0))
@@ -773,23 +550,14 @@ def centroid_distance(box_a, box_b):
 
 def compute_crop_diagnostics(bbox, img_w, img_h, crop_style, background_area_flag_threshold=0.7):
     """
-    Failure-mode diagnostics for a predicted bounding box, mirroring
-    run_segmenter_inspect.py's per-image diagnostics:
-      - crop_area_fraction: fraction of the frame the box covers.
-      - bbox_aspect_ratio: width/height of the RAW box (before any
-        squarify padding).
-      - touches_border: proxy for under-recall or a genuinely clipped
-        source image.
-      - possible_background_false_positive: crop > `background_area_flag_
-        threshold` of the frame - likely a dish-rim/vignette false
-        detection rather than a genuinely embryo-filling frame.
-      - likely_visible_distortion: True only for `crop_style="warp"` boxes
-        whose aspect ratio deviates >20% from 1.0 (production's actual
-        bug); ALWAYS False for `crop_style="squarify"`, since
-        `squarify_bbox()` pads to a square BEFORE resizing, making a
-        non-uniform final resize impossible by construction, regardless
-        of how asymmetric the raw box is. This is what lets configs B/C
-        directly demonstrate the crop-distortion fix numerically.
+    Failure-mode flags for a predicted box:
+      crop_area_fraction                  fraction of the frame covered
+      bbox_aspect_ratio                   width/height of the raw box
+      touches_border                      box within 1 px of the edge
+      possible_background_false_positive  area > `background_area_flag_threshold`
+                                          (likely dish rim or vignette)
+      likely_visible_distortion           aspect off by >20% with a "warp" crop;
+                                          always False for "squarify"
     """
     min_x, min_y, max_x, max_y = bbox
     box_w = max(1, max_x - min_x)
@@ -812,11 +580,8 @@ def compute_crop_diagnostics(bbox, img_w, img_h, crop_style, background_area_fla
 
 def evaluate_pipeline_result(config, dataset_name, stem, result, gt_bin, img_w, img_h,
                               hd_percentile, background_area_flag_threshold, latency_ms):
-    """Builds one --mode pipeline per-image CSV row from a
-    run_pipeline_config() result plus the ground-truth
-    mask: Tier 1 (raw mask) + Tier 2 (post-contour mask) Dice/IoU/HD95,
-    Tier 3 (bbox IoU, embryo recall, centroid distance, crop diagnostics),
-    fallback flags, and latency."""
+    """One per-image CSV row: Tier 1/2 mask metrics, Tier 3 box metrics,
+    failure flags, and latency."""
     raw_bin = result["raw_mask"] > 0.5
     filtered_bin = result["filtered_mask"] > 0.5
 
@@ -851,8 +616,7 @@ def evaluate_pipeline_result(config, dataset_name, stem, result, gt_bin, img_w, 
 
 
 def aggregate_pipeline_rows(rows):
-    """Mean/rate aggregation over a list of evaluate_pipeline_result()
-    rows (e.g. all rows for one config, or one (config, dataset) group)."""
+    """Means, flag rates, and latency stats over a group of per-image rows."""
     def mean_of(key):
         vals = [r[key] for r in rows if r.get(key) is not None]
         return float(np.mean(vals)) if vals else float("nan")
@@ -890,14 +654,7 @@ def aggregate_pipeline_rows(rows):
 
 
 def model_storage_stats(model, weights_path):
-    """
-    Storage/deployability numbers for a loaded checkpoint:
-      - n_params: trainable parameter count
-      - n_params_m: same, in millions (for plotting)
-      - weights_file_mb: on-disk .pt file size
-      - model_ram_mb: in-memory footprint of loaded parameters + buffers
-        (actual element sizes, not just n_params * 4)
-    """
+    """Parameter count, checkpoint file size, and in-memory size (params + buffers)."""
     n_params = sum(p.numel() for p in model.parameters())
     ram_bytes = sum(p.numel() * p.element_size() for p in model.parameters())
     ram_bytes += sum(b.numel() * b.element_size() for b in model.buffers())
@@ -912,8 +669,7 @@ def model_storage_stats(model, weights_path):
 
 
 def build_pipeline_resource_rows(summary_all, models):
-    """One deployability row per pipeline config (ALL-dataset summary only).
-    `models` is load_pipeline_models()'s {config: (model, weights_path)}."""
+    """One time + storage row per config, from the ALL-dataset summary."""
     rows = []
     for summary in summary_all:
         config = summary["config"]
@@ -950,6 +706,22 @@ def write_csv(path, rows):
     print(f"Wrote {len(rows)} row(s) to {os.path.abspath(path)}")
 
 
+def round_floats(rows, ndigits=4):
+    """Round every float value in a list of CSV row dicts, in place."""
+    for row in rows:
+        for k, v in row.items():
+            if isinstance(v, float):
+                row[k] = round(v, ndigits)
+
+
+def resolve_dataset_names(args):
+    """--dataset-name values, or each --images-dir's basename."""
+    names = _expand_per_pair(args.dataset_name, len(args.images_dir), "dataset-name", None)
+    if names[0] is None:
+        names = [os.path.basename(os.path.normpath(d)) for d in args.images_dir]
+    return names
+
+
 def default_model_name(weights_path):
     parent = os.path.basename(os.path.dirname(os.path.abspath(weights_path)))
     stem = os.path.splitext(os.path.basename(weights_path))[0]
@@ -960,14 +732,22 @@ def default_model_name(weights_path):
 # Plots: --mode model
 # ---------------------------------------------------------------------------
 
-def plot_threshold_sweep(sweep_rows, out_path):
+def _import_pyplot(out_path):
+    """matplotlib.pyplot (Agg backend), or None with a warning if not installed."""
     try:
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
     except ImportError:
-        print("WARNING: matplotlib not installed, skipping threshold_sweep.png "
-              "(pip install matplotlib to enable; numbers are still in threshold_sweep.csv).")
+        print(f"WARNING: matplotlib not installed, skipping {os.path.basename(out_path)} "
+              "(pip install matplotlib to enable; the numbers are still in the CSVs).")
+        return None
+    return plt
+
+
+def plot_threshold_sweep(sweep_rows, out_path):
+    plt = _import_pyplot(out_path)
+    if plt is None:
         return
 
     models = sorted({r["model"] for r in sweep_rows})
@@ -994,18 +774,9 @@ def plot_threshold_sweep(sweep_rows, out_path):
 
 
 def plot_benchmark_dice_iou(summary_rows, per_image_rows, threshold, out_path):
-    """
-    Headline benchmark figure: grouped bar chart of mean Dice and mean IoU
-    per model at the fixed reporting threshold, with +/-1 std error bars
-    computed across images.
-    """
-    try:
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-    except ImportError:
-        print("WARNING: matplotlib not installed, skipping benchmark_dice_iou.png "
-              "(pip install matplotlib to enable).")
+    """Mean Dice/IoU per model at `threshold`, with +/-1 std error bars."""
+    plt = _import_pyplot(out_path)
+    if plt is None:
         return
 
     models = [r["model"] for r in summary_rows]
@@ -1053,13 +824,8 @@ def plot_benchmark_dice_iou(summary_rows, per_image_rows, threshold, out_path):
 
 def plot_per_image_dice_iou(per_image_rows, threshold, out_path):
     """Per-image Dice/IoU distributions per model (box plot + jittered points)."""
-    try:
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-    except ImportError:
-        print("WARNING: matplotlib not installed, skipping per_image_dice_iou.png "
-              "(pip install matplotlib to enable).")
+    plt = _import_pyplot(out_path)
+    if plt is None:
         return
 
     models = sorted({r["model"] for r in per_image_rows})
@@ -1106,13 +872,8 @@ def plot_per_image_dice_iou(per_image_rows, threshold, out_path):
 
 
 def plot_calibration(calibration_curves, out_path):
-    try:
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-    except ImportError:
-        print("WARNING: matplotlib not installed, skipping calibration.png "
-              "(pip install matplotlib to enable; numbers are still in calibration_bins.csv).")
+    plt = _import_pyplot(out_path)
+    if plt is None:
         return
 
     fig, ax = plt.subplots(figsize=(5.5, 5.5))
@@ -1139,16 +900,9 @@ def plot_calibration(calibration_curves, out_path):
 # ---------------------------------------------------------------------------
 
 def plot_pipeline_dice_iou(summary_all, per_image_rows, out_path):
-    """Grouped bar chart: mean Tier-2 (post-contour-filtering) Dice/IoU
-    +/- std, one group of bars per pipeline config, combined across all
-    dataset sources ('ALL'). Same visual style as plot_benchmark_dice_iou
-    (--mode model's equivalent figure), but for full pipelines."""
-    try:
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-    except ImportError:
-        print("WARNING: matplotlib not installed, skipping pipeline_dice_iou.png.")
+    """Mean Tier-2 Dice/IoU +/- std per config, all datasets combined."""
+    plt = _import_pyplot(out_path)
+    if plt is None:
         return
 
     configs = [r["config"] for r in summary_all]
@@ -1188,14 +942,9 @@ def plot_pipeline_dice_iou(summary_all, per_image_rows, out_path):
 
 
 def plot_pipeline_bbox_metrics(summary_all, out_path):
-    """Grouped bar chart: bbox IoU vs. GT and embryo recall-in-bbox, one
-    group per pipeline config."""
-    try:
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-    except ImportError:
-        print("WARNING: matplotlib not installed, skipping pipeline_bbox_metrics.png.")
+    """Bbox IoU vs. GT and embryo recall-in-bbox per config."""
+    plt = _import_pyplot(out_path)
+    if plt is None:
         return
 
     configs = [r["config"] for r in summary_all]
@@ -1229,16 +978,9 @@ def plot_pipeline_bbox_metrics(summary_all, out_path):
 
 
 def plot_pipeline_failure_rates(summary_all, out_path):
-    """Grouped bar chart of failure-mode/deployability rates (fraction of
-    images) per pipeline config: full-image fallback, border-touch,
-    possible dish/vignette false positive, visible aspect-ratio
-    distortion. Lower is better for all four."""
-    try:
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-    except ImportError:
-        print("WARNING: matplotlib not installed, skipping pipeline_failure_rates.png.")
+    """Failure-mode rates per config (lower is better)."""
+    plt = _import_pyplot(out_path)
+    if plt is None:
         return
 
     configs = [r["config"] for r in summary_all]
@@ -1273,14 +1015,9 @@ def plot_pipeline_failure_rates(summary_all, out_path):
 
 
 def plot_pipeline_per_image_box(per_image_rows, out_path):
-    """Per-image Tier-2 (post-contour) Dice/IoU distributions per pipeline
-    config (box plot + jittered points)."""
-    try:
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-    except ImportError:
-        print("WARNING: matplotlib not installed, skipping pipeline_per_image_dice_iou.png.")
+    """Per-image Tier-2 Dice/IoU distributions per config (box plot + points)."""
+    plt = _import_pyplot(out_path)
+    if plt is None:
         return
 
     configs = sorted({r["config"] for r in per_image_rows})
@@ -1321,18 +1058,9 @@ def plot_pipeline_per_image_box(per_image_rows, out_path):
 
 
 def plot_pipeline_by_dataset(summary_by_dataset, out_path, metric="tier2_dice", title_metric="Dice"):
-    """Grouped bar chart: x = dataset source, groups = pipeline config,
-    y = mean metric. Lets you see whether a config's ranking holds up
-    consistently across the old paper dataset and the newer Labelme-
-    labeled set, rather than trusting one pooled number - important since
-    a model may have literally been trained on some of these images (see
-    the caution message printed at the end of run_pipeline_mode)."""
-    try:
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-    except ImportError:
-        print(f"WARNING: matplotlib not installed, skipping {os.path.basename(out_path)}.")
+    """Mean `metric` per dataset source, one bar per config."""
+    plt = _import_pyplot(out_path)
+    if plt is None:
         return
 
     datasets = sorted({r["dataset"] for r in summary_by_dataset})
@@ -1370,12 +1098,8 @@ def plot_pipeline_resources(resource_rows, out_path):
       3. Model storage: parameter count (M), checkpoint file size (MB),
          in-memory footprint (MB)
     """
-    try:
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-    except ImportError:
-        print("WARNING: matplotlib not installed, skipping pipeline_resources.png.")
+    plt = _import_pyplot(out_path)
+    if plt is None:
         return
 
     if not resource_rows:
@@ -1431,8 +1155,7 @@ def plot_pipeline_resources(resource_rows, out_path):
     ax.set_xticklabels(configs)
     ax.set_ylabel("size")
     ax.set_title("Model storage / memory footprint")
-    # Headroom above the tallest bar + a single-row legend, so the legend
-    # sits above the value labels instead of covering them.
+    # Headroom so the legend doesn't cover the value labels.
     ax.set_ylim(0, max(max(params_m), max(weights_mb), max(ram_mb)) * 1.3)
     ax.legend(fontsize=7, loc="upper center", ncol=3, frameon=False)
     ax.grid(axis="y", alpha=0.3)
@@ -1447,12 +1170,8 @@ def plot_pipeline_resources(resource_rows, out_path):
 
 def plot_pipeline_latency_box(per_image_rows, out_path):
     """Per-image end-to-end latency distribution per pipeline config (box plot)."""
-    try:
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-    except ImportError:
-        print("WARNING: matplotlib not installed, skipping pipeline_latency_box.png.")
+    plt = _import_pyplot(out_path)
+    if plt is None:
         return
 
     configs = sorted({r["config"] for r in per_image_rows})
@@ -1503,9 +1222,7 @@ def parse_pipeline_configs(configs_arg):
 
 
 def load_pipeline_models(args, configs):
-    """Load the checkpoint each config needs (its "weights_arg" CLI option).
-    A checkpoint shared by several configs (e.g. A and B) is loaded once.
-    Returns {config: (model, weights_path)}."""
+    """{config: (model, weights_path)}; shared checkpoints are loaded once."""
     loaded = {}
     models = {}
     for config in configs:
@@ -1523,14 +1240,10 @@ def load_pipeline_models(args, configs):
 
 def run_pipeline_config(config, models, img, args):
     """
-    Run one pipeline config (an entry of CONFIG_TYPES) on `img`: optional
-    brightness correction, one forward pass, contour filtering, and a
-    full-frame fallback if the filtered mask is empty.
-
-    `raw_mask` in the returned dict is whichever forward pass's output fed
-    the filtered mask - the retry's output if a "retry_if_empty" retry
-    happened. `brightness_fallback_triggered` is None unless the config's
-    brightness mode is "retry_if_empty" (the other modes have no retry).
+    Run one CONFIG_TYPES entry on `img`: brightness step, forward pass,
+    contour filter, and a full-frame fallback if the mask ends up empty.
+    `raw_mask` is from the pass that fed the filter (the retry, if any);
+    `brightness_fallback_triggered` is None unless brightness is "retry_if_empty".
     """
     model, _weights_path = models[config]
     config_type = CONFIG_TYPES[config]
@@ -1565,8 +1278,7 @@ def run_pipeline_config(config, models, img, args):
 
 
 def warmup_pipeline_models(models, img_arr, args, n_warmup):
-    """Run a few untimed iterations so latency measurements aren't dominated
-    by one-time CPU cache / PyTorch thread-pool warmup effects."""
+    """Untimed runs so one-time warmup doesn't skew latency."""
     for config in models:
         for _ in range(n_warmup):
             run_pipeline_config(config, models, img_arr, args)
@@ -1735,10 +1447,8 @@ def run_pipeline_mode(args):
             sys.exit(1)
         mask_suffixes = _expand_per_pair(args.mask_suffix, n_pairs, "mask-suffix", "_mask")
         mask_exts = _expand_per_pair(args.mask_ext, n_pairs, "mask-ext", ".png")
-        dataset_names = _expand_per_pair(args.dataset_name, n_pairs, "dataset-name", None)
-        if dataset_names[0] is None:
-            dataset_names = [os.path.basename(os.path.normpath(d)) for d in args.images_dir]
-        sources = list(zip(dataset_names, args.images_dir, args.masks_dir, mask_suffixes, mask_exts))
+        sources = list(zip(resolve_dataset_names(args), args.images_dir, args.masks_dir,
+                           mask_suffixes, mask_exts))
     else:
         sources = DEFAULT_PIPELINE_SOURCES
         print("No --images-dir given; using this repo's 4 default labeled sources "
@@ -1810,11 +1520,7 @@ def run_pipeline_mode(args):
             summary_rows.append({"dataset": dataset_name, "config": config,
                                  "n_params": n_params_by_config[config], **agg_ds})
 
-    for row in summary_rows:
-        for k, v in row.items():
-            if isinstance(v, float):
-                row[k] = round(v, 4)
-
+    round_floats(summary_rows)
     write_csv(os.path.join(args.output_dir, "pipeline_summary.csv"), summary_rows)
 
     summary_all = [r for r in summary_rows if r["dataset"] == "ALL"]
@@ -1832,10 +1538,7 @@ def run_pipeline_mode(args):
               f"distortion={r['pct_visible_distortion']:.2%}")
 
     resource_rows = build_pipeline_resource_rows(summary_all, models)
-    for row in resource_rows:
-        for k, v in row.items():
-            if isinstance(v, float):
-                row[k] = round(v, 4)
+    round_floats(resource_rows)
     write_csv(os.path.join(args.output_dir, "pipeline_resources.csv"), resource_rows)
 
     print("\n=== Pipeline deployability (time + storage) ===")
@@ -1879,16 +1582,12 @@ def run_pipeline_mode(args):
 # ---------------------------------------------------------------------------
 
 def run_crops_mode(args):
-    """Run configs A/B/C on unlabeled images and save each config's final
-    224x224 crop - no masks and no metrics, just the images plus a manifest
-    of per-image crop diagnostics. Blank images (max pixel 0) are skipped,
-    as in preprocessing_images.py."""
+    """Save each config's 224x224 crops for unlabeled images, plus a
+    diagnostics manifest. Blank images are skipped."""
     if not args.images_dir:
         print("ERROR: --mode crops needs at least one --images-dir.", file=sys.stderr)
         sys.exit(1)
-    dataset_names = _expand_per_pair(args.dataset_name, len(args.images_dir), "dataset-name", None)
-    if dataset_names[0] is None:
-        dataset_names = [os.path.basename(os.path.normpath(d)) for d in args.images_dir]
+    dataset_names = resolve_dataset_names(args)
 
     configs_to_run = parse_pipeline_configs(args.configs)
     models = load_pipeline_models(args, configs_to_run)
@@ -1948,14 +1647,13 @@ def run_crops_mode(args):
 
     print("\n=== Crop summary per config ===")
     for config in configs_to_run:
-        rows = [r for r in manifest_rows if r["config"] == config]
-        rate = lambda key: sum(bool(r[key]) for r in rows) / len(rows)
-        print(f"  [{config}] n={len(rows)}  "
-              f"fallback={rate('full_image_fallback_triggered'):.2%}  "
-              f"border={rate('touches_border'):.2%}  "
-              f"bg_fp={rate('possible_background_false_positive'):.2%}  "
-              f"distortion={rate('likely_visible_distortion'):.2%}  "
-              f"mean crop area={np.mean([r['crop_area_fraction'] for r in rows]):.3f}")
+        agg = aggregate_pipeline_rows([r for r in manifest_rows if r["config"] == config])
+        print(f"  [{config}] n={agg['n_images']}  "
+              f"fallback={agg['pct_full_image_fallback']:.2%}  "
+              f"border={agg['pct_touches_border']:.2%}  "
+              f"bg_fp={agg['pct_background_false_positive']:.2%}  "
+              f"distortion={agg['pct_visible_distortion']:.2%}  "
+              f"mean crop area={agg['crop_area_fraction']:.3f}")
     if n_blank:
         print(f"Skipped {n_blank} blank image(s).")
     print(f"\nDone in {(time.perf_counter() - t_start) / 60:.1f} min. Crops under "
@@ -1969,120 +1667,77 @@ def run_crops_mode(args):
 
 def build_arg_parser():
     parser = argparse.ArgumentParser(
-        description="Benchmark the embryo segmenter. --mode model (default): raw CNN mask "
-                    "quality (Dice/IoU/HD95/threshold-sweep/calibration) for one or more "
-                    "checkpoints. --mode pipeline: full end-to-end preprocessing-pipeline "
-                    "comparison (model + contour-selection + crop) across named configs "
-                    "A/B/C - see module docstring.")
+        description="Benchmark the embryo segmenter: raw mask quality (--mode model), "
+                    "end-to-end pipeline configs (--mode pipeline), or crops only "
+                    "(--mode crops). See the module docstring.")
     parser.add_argument("--mode", choices=["model", "pipeline", "crops"], default="model",
-                        help="'model' (default), 'pipeline', or 'crops' (run configs on "
-                             "unlabeled --images-dir and only save crops) - see module "
-                             "docstring.")
+                        help="model (default), pipeline, or crops.")
 
     data = parser.add_argument_group("data selection")
     data.add_argument("--images-dir", action="append", default=None,
-                      help="Directory of raw images (repeatable). --mode model default: "
-                           f"{DEFAULT_IMAGES_DIR}. --mode pipeline default (if omitted): all 4 "
-                           "of this repo's labeled sources combined (see module docstring).")
+                      help="Raw image directory (repeatable). Model-mode default: "
+                           f"{DEFAULT_IMAGES_DIR}; pipeline-mode default: the 4 labeled sources.")
     data.add_argument("--masks-dir", action="append", default=None,
-                      help="Directory of mask files matching --images-dir (repeatable). "
-                           f"--mode model default: {DEFAULT_MASKS_DIR}.")
+                      help="Mask directory for each --images-dir (repeatable). "
+                           f"Model-mode default: {DEFAULT_MASKS_DIR}.")
     data.add_argument("--mask-suffix", action="append", default=None,
-                      help="Mask filename suffix, one per --images-dir pair (default: _mask, "
-                           "matching labelme_json_to_mask.py - see train_segmenter.py). Pass "
-                           "'' for the original paper dataset (mask named identically to the "
-                           "image, e.g. --mask-suffix '' --mask-ext .jpg).")
+                      help="Mask filename suffix per pair (default: _mask). Use '' with "
+                           "--mask-ext .jpg for the original paper dataset.")
     data.add_argument("--mask-ext", action="append", default=None,
-                      help="Mask file extension, one per --images-dir pair (default: .png).")
+                      help="Mask file extension per pair (default: .png).")
     data.add_argument("--dataset-name", action="append", default=None,
-                      help="(--mode pipeline only) Display name for each --images-dir/"
-                           "--masks-dir pair, for the per-dataset breakdown in "
-                           "pipeline_summary.csv/pipeline_dice_by_dataset.png (repeatable). "
-                           "Default: derived from each --images-dir's basename.")
+                      help="Display name per --images-dir (default: directory basename).")
 
     model_grp = parser.add_argument_group("--mode model options")
     model_grp.add_argument("--weights", action="append", default=None,
-                           help="Path to a segmenter .pt checkpoint (repeatable, to compare "
-                                f"multiple checkpoints in one run). Default: {DEFAULT_WEIGHTS} "
-                                "(current production weights). Architecture is auto-detected "
-                                "per checkpoint.")
+                           help=f"Checkpoint to evaluate (repeatable; default: {DEFAULT_WEIGHTS}). "
+                                "Architecture is auto-detected.")
     model_grp.add_argument("--weights-name", action="append", default=None,
-                           help="Display name for each --weights entry, in the same order "
-                                "(repeatable). Default: derived from each path's "
-                                "parent-dir/filename.")
+                           help="Display name per --weights, in order (default: parent-dir/filename).")
     model_grp.add_argument("--threshold", type=float, default=0.5,
-                           help="Fixed reporting threshold for per_image_metrics.csv/"
-                                "summary.csv (default: 0.5, matching production's "
-                                "segment_image()).")
+                           help="Reporting threshold (default: 0.5).")
     model_grp.add_argument("--threshold-min", type=float, default=0.05,
                            help="Lowest threshold in the sweep (default: 0.05).")
     model_grp.add_argument("--threshold-max", type=float, default=0.95,
                            help="Highest threshold in the sweep (default: 0.95).")
     model_grp.add_argument("--threshold-step", type=float, default=0.05,
-                           help="Step size for the threshold sweep (default: 0.05).")
+                           help="Sweep step (default: 0.05).")
     model_grp.add_argument("--calibration-bins", type=int, default=10,
-                           help="Number of probability bins for the reliability "
-                                "diagram/ECE (default: 10).")
+                           help="Probability bins for calibration/ECE (default: 10).")
 
     pipeline_grp = parser.add_argument_group("--mode pipeline options")
     pipeline_grp.add_argument("--prod-weights", default=DEFAULT_WEIGHTS,
-                              help="Production (non-skip-connection) checkpoint, used by "
-                                   f"configs A/B (default: {DEFAULT_WEIGHTS}).")
+                              help=f"SegmenterModel checkpoint for configs A/B (default: {DEFAULT_WEIGHTS}).")
     pipeline_grp.add_argument("--skip-weights", default=DEFAULT_SKIP_WEIGHTS,
-                              help="SegmenterModelSkip checkpoint, used by config C "
+                              help="SegmenterModelSkip checkpoint for config C "
                                    f"(default: {DEFAULT_SKIP_WEIGHTS}).")
     pipeline_grp.add_argument("--configs", default="A,B,C",
-                              help="Comma-separated subset of pipeline configs to run "
-                                   "(default: all three - A,B,C). A=previous production pipeline; "
-                                   "B=preprocessing_images.py pipeline, production weights; "
-                                   "C=same pipeline, SegmenterModelSkip weights. "
-                                   "See module docstring for full descriptions.")
+                              help="Comma-separated configs from CONFIG_TYPES (default: A,B,C).")
     pipeline_grp.add_argument("--max-area-frac", type=float, default=0.9,
-                              help="select_best_contour's implausibly-large-contour reject "
-                                   "threshold, as a fraction of the frame (default: 0.9). "
-                                   "Used by configs B/C.")
+                              help="select_best_contour: max contour area as a frame fraction (default: 0.9).")
     pipeline_grp.add_argument("--border-margin", type=int, default=2,
-                              help="select_best_contour's border-touch pixel margin "
-                                   "(default: 2). Used by configs B/C.")
+                              help="select_best_contour: border-touch margin in px (default: 2).")
     pipeline_grp.add_argument("--min-area-frac", type=float, default=0.1,
-                              help="select_best_contour's noise-speck-rejection area floor, "
-                                   "as a fraction of the frame (default: 0.1, i.e. 10%%, "
-                                   "matching select_best_contour()'s own default and "
-                                   "run_segmenter_inspect.py's CLI default). Used by configs "
-                                   "B/C.")
+                              help="select_best_contour: min contour area as a frame fraction (default: 0.1).")
     pipeline_grp.add_argument("--circularity-threshold", type=float, default=0.7,
-                              help="Config A's circularity-union filter threshold, matching "
-                                   "preprocessing_images.py's hardcoded value (default: 0.7).")
+                              help="Config A circularity threshold (default: 0.7).")
     pipeline_grp.add_argument("--background-area-flag-threshold", type=float, default=0.7,
-                              help="Flag a crop as 'possible_background_false_positive' if it "
-                                   "covers more than this fraction of the frame (default: "
-                                   "0.7). Matches run_segmenter_inspect.py's CLI default.")
+                              help="Flag crops covering more than this frame fraction (default: 0.7).")
     pipeline_grp.add_argument("--timing-warmup", type=int, default=3,
-                              help="Untimed pipeline iterations per loaded model before "
-                                   "measuring latency (default: 3). Set to 0 to disable. "
-                                   "Reduces one-time CPU/PyTorch warmup bias in timing stats.")
+                              help="Untimed iterations per model before timing (default: 3; 0 disables).")
     pipeline_grp.add_argument("--save-crops", action="store_true",
-                              help="Save each config's final 224x224 crop under "
-                                   "<output-dir>/crops/<config>/<dataset>/<original filename>. "
-                                   "Config A is the direct (warp) crop; B and C square the "
-                                   "box before resizing. Off by default.")
+                              help="Also save each config's crops to <output-dir>/crops/<config>/<dataset>/.")
 
     shared = parser.add_argument_group("shared options")
     shared.add_argument("--hd-percentile", type=float, default=95.0,
-                        help="Percentile for the 'HD95' metric (default: 95.0). Set to 100 "
-                             "to make hd95 identical to the raw max Hausdorff distance.")
+                        help="Percentile for the hd95 metric (default: 95; 100 = max Hausdorff).")
     shared.add_argument("--output-dir", default=None,
-                        help="Directory to write CSVs/plots to. Default: "
-                             "./segmenter_eval_output (--mode model) or "
-                             "./segmenter_pipeline_eval_output (--mode pipeline).")
+                        help="Output directory (default: segmenter_eval_output, "
+                             "segmenter_pipeline_eval_output, or segmenter_crops_output).")
     shared.add_argument("--device", default=None,
-                        help="cuda / cpu (default: auto-detect). --mode model only - "
-                             "--mode pipeline is always CPU-only, matching production/"
-                             "run_segmenter_inspect.py (segment_image() doesn't accept a "
-                             "device argument).")
+                        help="cuda/cpu for --mode model (default: auto). Pipeline modes run on CPU.")
 
     return parser
-
 
 def main():
     parser = build_arg_parser()
